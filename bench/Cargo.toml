@@ -1,0 +1,46 @@
+[package]
+name = "livechat-bench"
+version = "0.2.0"
+edition = "2021"
+description = "SFU benchmark client for light-livechat — fan-out throughput & latency measurement"
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+
+[[bin]]
+name = "sfu-bench"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+
+# WebSocket client (signaling)
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# DTLS + SRTP — 서버와 동일 0.17.x 계열
+dtls        = "0.17.1"
+webrtc-srtp = "0.17.1"
+webrtc-util = "0.17.1"
+
+# STUN MESSAGE-INTEGRITY
+hmac = "0.12"
+sha1 = "0.10"
+crc32fast = "1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# async
+async-trait = "0.1"
+
+# random
+getrandom = { version = "0.3", features = ["std"] }
