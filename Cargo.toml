@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "common",
+    "bench",
+    "e2e-ptt",
+]
+resolver = "2"

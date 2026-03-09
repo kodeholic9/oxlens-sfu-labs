@@ -1,18 +1,11 @@
 [package]
-name = "livechat-bench"
-version = "0.3.0"
+name = "oxlens-lab-common"
+version = "0.1.0"
 edition = "2021"
-description = "SFU benchmark client for oxlens-sfu-server — fan-out throughput & latency measurement"
+description = "Shared client library for oxlens-sfu-labs (signaling, STUN, DTLS, SRTP, MBCP)"
 authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
 
-[[bin]]
-name = "sfu-bench"
-path = "src/main.rs"
-
 [dependencies]
-# workspace common
-oxlens-lab-common = { path = "../common" }
-
 # async runtime
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
@@ -21,7 +14,7 @@ bytes = "1"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
-# DTLS + SRTP — 서버와 동일 0.17.x 계열
+# DTLS + SRTP
 dtls        = "0.17.1"
 webrtc-srtp = "0.17.1"
 webrtc-util = "0.17.1"
@@ -35,12 +28,8 @@ crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# CLI
-clap = { version = "4", features = ["derive"] }
-
 # logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # async
 async-trait = "0.1"
