@@ -18,11 +18,17 @@ pub const OP_ROOM_CREATE: u16 = 10;
 pub const OP_ROOM_JOIN: u16 = 11;
 pub const OP_PUBLISH_TRACKS: u16 = 15;
 
-// Floor control opcodes (WS 하이브리드 이벤트)
-pub const OP_FLOOR_REQUEST: u16 = 30;
-pub const OP_FLOOR_RELEASE: u16 = 31;
-pub const OP_FLOOR_TAKEN: u16 = 32;
-pub const OP_FLOOR_IDLE: u16 = 33;
+// Floor control opcodes (서버 opcode.rs와 동일)
+pub const OP_FLOOR_REQUEST: u16 = 40;
+pub const OP_FLOOR_RELEASE: u16 = 41;
+pub const OP_FLOOR_PING: u16 = 42;
+pub const OP_FLOOR_QUEUE_POS: u16 = 43;
+pub const OP_ROOM_SYNC: u16 = 50;
+
+// Floor events (Server → Client)
+pub const OP_FLOOR_TAKEN: u16 = 141;
+pub const OP_FLOOR_IDLE: u16 = 142;
+pub const OP_FLOOR_REVOKE: u16 = 143;
 
 // ── packet ──
 
@@ -262,6 +268,41 @@ impl SignalingSession {
     pub async fn heartbeat(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _ = self.request(OP_HEARTBEAT, serde_json::json!({})).await?;
         Ok(())
+    }
+
+    // ── Floor Control (WS) ──
+
+    /// WS Floor Request with priority (v2)
+    /// Returns the raw response packet (ok=true with granted/queued, or ok=false with deny)
+    pub async fn floor_request(
+        &mut self,
+        room_id: &str,
+        priority: u8,
+    ) -> Result<Packet, Box<dyn std::error::Error + Send + Sync>> {
+        self.request(OP_FLOOR_REQUEST, serde_json::json!({
+            "room_id": room_id,
+            "priority": priority,
+        })).await
+    }
+
+    /// WS Floor Release
+    pub async fn floor_release(
+        &mut self,
+        room_id: &str,
+    ) -> Result<Packet, Box<dyn std::error::Error + Send + Sync>> {
+        self.request(OP_FLOOR_RELEASE, serde_json::json!({
+            "room_id": room_id,
+        })).await
+    }
+
+    /// WS Floor Queue Position query
+    pub async fn floor_queue_pos(
+        &mut self,
+        room_id: &str,
+    ) -> Result<Packet, Box<dyn std::error::Error + Send + Sync>> {
+        self.request(OP_FLOOR_QUEUE_POS, serde_json::json!({
+            "room_id": room_id,
+        })).await
     }
 
     /// 이벤트 버퍼에서 특정 opcode를 가진 패킷을 꺼냄 (없으면 None)

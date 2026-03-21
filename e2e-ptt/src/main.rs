@@ -1,15 +1,19 @@
 // author: kodeholic (powered by Claude)
-//! e2e-ptt — PTT Floor Control E2E test
+//! e2e-ptt — PTT Floor Control E2E test (v2: priority + queuing + preemption)
 //!
 //! 서버(oxlens-sfu-server)를 실제로 띄운 상태에서 실행.
-//! 2~3명의 가상 참가자가 WS 시그널링 + STUN + DTLS + SRTP 풀 파이프라인을 연결하고,
-//! RTCP APP(MBCP) 패킷을 통한 Floor Control 시나리오를 검증한다.
 //!
-//! 테스트 시나리오:
-//!   1. basic_grant_release:  A FREQ → FTKN 수신 → RTP 전송 → B 수신 → FREL → FIDL
-//!   2. deny_when_busy:       A 발화 중 B FREQ → B가 FRVK(denied) 수신
-//!   3. floor_switch:         A FREL 후 B FREQ → B FTKN
-//!   4. rtp_gating:           비발화자의 RTP가 subscriber에 도달하지 않음 확인
+//! Part 1 — MBCP scenarios (full media pipeline):
+//!   1. basic_grant_release:     A FREQ → FTKN → FREL → FIDL
+//!   2. queued_when_busy:        A 발화 + B FREQ → B Queued (v2 큐잉)
+//!   3. floor_switch:            A FREL 후 B FREQ → B FTKN
+//!   4. rtp_gating:              비발화자 RTP 차단 확인
+//!
+//! Part 2 — WS Floor v2 scenarios (signaling only):
+//!   5. ws_priority_queuing:     A(pri=5) + B(pri=2) → B Queued
+//!   6. ws_preemption:           A(pri=2) + B(pri=5) → A revoked, B granted
+//!   7. ws_queue_pop_on_release: A + B큐 → A release → B 자동 granted
+//!   8. ws_queue_position:       A + B,C큐 → 우선순위 정렬 + 큐 위치 조회
 
 mod scenario;
 
@@ -55,10 +59,16 @@ async fn main() {
     info!("server: {}:{} (ws:{})", args.server, args.udp_port, args.ws_port);
 
     let tests: Vec<(&str, fn(&Args) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>)> = vec![
-        ("basic_grant_release", |a| Box::pin(scenario::test_basic_grant_release(a))),
-        ("deny_when_busy",      |a| Box::pin(scenario::test_deny_when_busy(a))),
-        ("floor_switch",        |a| Box::pin(scenario::test_floor_switch(a))),
-        ("rtp_gating",          |a| Box::pin(scenario::test_rtp_gating(a))),
+        // Part 1: MBCP scenarios
+        ("basic_grant_release",    |a| Box::pin(scenario::test_basic_grant_release(a))),
+        ("queued_when_busy",       |a| Box::pin(scenario::test_queued_when_busy(a))),
+        ("floor_switch",           |a| Box::pin(scenario::test_floor_switch(a))),
+        ("rtp_gating",             |a| Box::pin(scenario::test_rtp_gating(a))),
+        // Part 2: WS Floor v2 scenarios
+        ("ws_priority_queuing",    |a| Box::pin(scenario::test_ws_priority_queuing(a))),
+        ("ws_preemption",          |a| Box::pin(scenario::test_ws_preemption(a))),
+        ("ws_queue_pop_on_release",|a| Box::pin(scenario::test_ws_queue_pop_on_release(a))),
+        ("ws_queue_position",      |a| Box::pin(scenario::test_ws_queue_position(a))),
     ];
 
     let mut passed = 0;
