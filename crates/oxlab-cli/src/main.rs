@@ -2,13 +2,17 @@
 //! oxlab — OxLabs 통합 CLI
 //!
 //! Phase 0: `oxlab run` — 봇 N개 spawn + SFU 접속 + 방 입장
+//! Phase 1: `oxlab run --media` — 미디어 셋업 + Fake RTP 전송
+//!
+//! 설정 우선순위: CLI 인자 > 환경변수(OXLAB_*) > .env 파일 > 기본값
 //!
 //! Usage:
-//!   oxlab run --server 127.0.0.1 --port 9222 --room test --bots 3
-//!   oxlab run --server 127.0.0.1 --room test --bots 5 --mode ptt --profile field_lte
+//!   oxlab run                                    # .env 기본값 사용
+//!   oxlab run --media --hold 10                  # .env + 일부 오버라이드
+//!   oxlab run --server 10.0.0.1 --port 9222      # 전체 명시
 
 use clap::{Parser, Subcommand};
-use oxlab_bot::{Bot, BotConfig};
+use oxlab_bot::{Bot, BotConfig, BotStatus};
 use oxlab_net::{NetFilter, NetworkProfile};
 use std::time::Duration;
 use tracing::{error, info};
@@ -25,38 +29,44 @@ enum Commands {
     /// 봇을 spawn하여 SFU에 접속
     Run {
         /// SFU 서버 주소
-        #[arg(long, default_value = "127.0.0.1")]
+        #[arg(long, env = "OXLAB_SERVER", default_value = "127.0.0.1")]
         server: String,
 
         /// WS 포트
-        #[arg(long, default_value_t = 9222)]
+        #[arg(long, env = "OXLAB_WS_PORT", default_value_t = 9222)]
         port: u16,
 
         /// 방 이름
-        #[arg(long, default_value = "oxlab-test")]
+        #[arg(long, env = "OXLAB_ROOM", default_value = "oxlab-test")]
         room: String,
 
         /// 방 모드 (conference | ptt)
-        #[arg(long, default_value = "conference")]
+        #[arg(long, env = "OXLAB_MODE", default_value = "conference")]
         mode: String,
 
         /// 봇 수
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, env = "OXLAB_BOTS", default_value_t = 3)]
         bots: usize,
 
-        /// 네트워크 프로파일 (전 봇 공통, builtin: pristine/office_wifi/field_lte/field_lte_poor/basement)
-        #[arg(long)]
+        /// 네트워크 프로파일 (builtin: pristine/office_wifi/field_lte/field_lte_poor/basement)
+        #[arg(long, env = "OXLAB_PROFILE")]
         profile: Option<String>,
 
         /// 접속 후 유지 시간 (초, 0 = 즉시 종료)
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, env = "OXLAB_HOLD", default_value_t = 10)]
         hold: u64,
+
+        /// 미디어 활성화 (STUN+DTLS+SRTP + Fake RTP 전송)
+        #[arg(long, default_value_t = false)]
+        media: bool,
     },
 }
 
 #[tokio::main]
 async fn main() {
-    // tracing 초기화
+    // .env 파일 로드 (없어도 에러 안 남)
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -68,15 +78,10 @@ async fn main() {
 
     match cli.command {
         Commands::Run {
-            server,
-            port,
-            room,
-            mode,
-            bots,
-            profile,
-            hold,
+            server, port, room, mode,
+            bots, profile, hold, media,
         } => {
-            cmd_run(server, port, room, mode, bots, profile, hold).await;
+            cmd_run(server, port, room, mode, bots, profile, hold, media).await;
         }
     }
 }
@@ -89,17 +94,15 @@ async fn cmd_run(
     bot_count: usize,
     profile_name: Option<String>,
     hold_secs: u64,
+    media_enabled: bool,
 ) {
-    info!("=== OxLabs Phase 0 ===");
+    let phase = if media_enabled { "Phase 1 (media)" } else { "Phase 0 (signaling)" };
+    info!("=== OxLabs {} ===", phase);
     info!(
-        "server={}:{} room={} mode={} bots={} profile={} hold={}s",
-        server,
-        port,
-        room,
-        mode,
-        bot_count,
+        "server={}:{} room={} mode={} bots={} profile={} hold={}s media={}",
+        server, port, room, mode, bot_count,
         profile_name.as_deref().unwrap_or("pristine"),
-        hold_secs
+        hold_secs, media_enabled
     );
 
     // 네트워크 프로파일 로드
@@ -120,11 +123,10 @@ async fn cmd_run(
         net_profile.conditions.bandwidth_kbps
     );
 
-    // 봇 생성 + 접속
-    let mut handles = Vec::new();
+    // ── 봇 생성 + 시그널링 접속 ──
+    let mut bots = Vec::new();
     let mut room_id: Option<String> = None;
 
-    // 첫 번째 봇이 방을 생성하고, 나머지는 기존 방에 참가
     for i in 0..bot_count {
         let bot_id = format!("bot_{}", i + 1);
         let config = BotConfig {
@@ -140,7 +142,6 @@ async fn cmd_run(
         let mut bot = Bot::new(config, Some(filter));
 
         if i == 0 {
-            // 첫 봇: 방 생성 + 입장
             match bot.connect_and_join().await {
                 Ok(()) => {
                     room_id = bot.room_id.clone();
@@ -152,7 +153,6 @@ async fn cmd_run(
                 }
             }
         } else {
-            // 나머지: 기존 방에 참가
             let rid = room_id.as_deref().expect("room_id should be set by bot_1");
             match bot.join_existing_room(rid).await {
                 Ok(()) => {}
@@ -163,13 +163,38 @@ async fn cmd_run(
             }
         }
 
-        handles.push(bot);
+        bots.push(bot);
     }
 
-    let joined = handles.iter().filter(|b| b.status == oxlab_bot::BotStatus::Joined).count();
+    let joined = bots.iter().filter(|b| b.status == BotStatus::Joined).count();
     info!("=== {} / {} bots joined ===", joined, bot_count);
 
-    // hold 시간 동안 유지 (heartbeat)
+    // ── 미디어 셋업 + Publishing ──
+    if media_enabled {
+        info!("── media setup ──");
+        for bot in &mut bots {
+            if bot.status != BotStatus::Joined { continue; }
+            let id = bot.id().to_string();
+
+            if let Err(e) = bot.setup_media().await {
+                error!("[{}] media setup failed: {}", id, e);
+                continue;
+            }
+            if let Err(e) = bot.publish_intent().await {
+                error!("[{}] publish_intent failed: {}", id, e);
+                continue;
+            }
+            if let Err(e) = bot.start_publishing() {
+                error!("[{}] start_publishing failed: {}", id, e);
+                continue;
+            }
+        }
+
+        let publishing = bots.iter().filter(|b| b.status == BotStatus::Publishing).count();
+        info!("=== {} / {} bots publishing ===", publishing, bot_count);
+    }
+
+    // ── Hold (heartbeat + recv metrics) ──
     if hold_secs > 0 {
         info!("holding for {}s (heartbeat every 5s)...", hold_secs);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(hold_secs);
@@ -180,20 +205,34 @@ async fn cmd_run(
                 break;
             }
 
-            for bot in &mut handles {
-                if bot.status == oxlab_bot::BotStatus::Joined {
+            for bot in &mut bots {
+                let active = bot.status == BotStatus::Joined
+                    || bot.status == BotStatus::MediaReady
+                    || bot.status == BotStatus::Publishing;
+                if active {
                     if let Err(e) = bot.heartbeat().await {
                         error!("[{}] heartbeat failed: {}", bot.id(), e);
                     }
+                }
+                if bot.status == BotStatus::Publishing {
+                    bot.log_recv_metrics();
                 }
             }
         }
     }
 
-    // 전체 봇 종료
-    for bot in &mut handles {
+    // ── 최종 수신 메트릭 ──
+    if media_enabled {
+        info!("── final recv metrics ──");
+        for bot in &bots {
+            bot.log_recv_metrics();
+        }
+    }
+
+    // ── 전체 봇 종료 ──
+    for bot in &mut bots {
         bot.disconnect().await;
     }
 
-    info!("=== OxLabs Phase 0 complete ===");
+    info!("=== OxLabs {} complete ===", phase);
 }

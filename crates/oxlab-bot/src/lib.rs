@@ -2,8 +2,12 @@
 //! oxlab-bot — SFU 테스트용 트래픽 봇
 //!
 //! Phase 0: WS 연결 → IDENTIFY → ROOM_JOIN (시그널링만)
-//! Phase 1 예정: Fake RTP Publisher/Subscriber, PTT 봇
+//! Phase 1: STUN+DTLS+SRTP 미디어 셋업 + Fake RTP 송수신
 
 pub mod bot;
+pub mod rtp_publisher;
+pub mod rtp_subscriber;
 
-pub use bot::{Bot, BotConfig, BotStatus};
+pub use bot::{Bot, BotConfig, BotStatus, MediaContext};
+pub use rtp_publisher::{RtpPublisherConfig, RtpPublisherState};
+pub use rtp_subscriber::{RecvMetricsStore, RecvSnapshot};
