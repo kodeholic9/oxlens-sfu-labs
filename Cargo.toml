@@ -3,5 +3,10 @@ members = [
     "common",
     "bench",
     "e2e-ptt",
+    "crates/oxlab-net",
+    "crates/oxlab-bot",
+    "crates/oxlab-scenario",
+    "crates/oxlab-judge",
+    "crates/oxlab-cli",
 ]
 resolver = "2"

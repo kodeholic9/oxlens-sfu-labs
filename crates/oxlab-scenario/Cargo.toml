@@ -1,0 +1,16 @@
+[package]
+name = "oxlab-scenario"
+version = "0.1.0"
+edition = "2021"
+description = "Scenario engine for OxLabs — profile + bot + timeline orchestration"
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+
+[dependencies]
+oxlab-bot = { path = "../oxlab-bot" }
+oxlab-net = { path = "../oxlab-net" }
+oxlab-judge = { path = "../oxlab-judge" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"

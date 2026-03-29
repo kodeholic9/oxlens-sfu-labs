@@ -1,0 +1,21 @@
+[package]
+name = "oxlab-cli"
+version = "0.1.0"
+edition = "2021"
+description = "OxLabs CLI — unified test runner"
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+
+[[bin]]
+name = "oxlab"
+path = "src/main.rs"
+
+[dependencies]
+oxlab-bot = { path = "../oxlab-bot" }
+oxlab-net = { path = "../oxlab-net" }
+oxlab-scenario = { path = "../oxlab-scenario" }
+oxlab-judge = { path = "../oxlab-judge" }
+
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

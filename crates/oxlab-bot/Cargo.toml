@@ -1,0 +1,15 @@
+[package]
+name = "oxlab-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Traffic bot for OxLabs — fake participants for SFU testing"
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+
+[dependencies]
+oxlens-lab-common = { path = "../../common" }
+oxlab-net = { path = "../oxlab-net" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"

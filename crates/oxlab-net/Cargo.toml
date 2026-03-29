@@ -1,0 +1,12 @@
+[package]
+name = "oxlab-net"
+version = "0.1.0"
+edition = "2021"
+description = "Userspace network filter for OxLabs — packet-level impairment injection"
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+
+[dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"

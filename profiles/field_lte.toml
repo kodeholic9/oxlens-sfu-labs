@@ -1,0 +1,13 @@
+# profiles/field_lte.toml
+# author: kodeholic (powered by Claude)
+
+[meta]
+name = "field_lte"
+description = "현장 LTE 양호"
+origin = "preset"
+
+[conditions]
+loss_percent = 2.0
+delay_ms = 50
+jitter_ms = 30
+bandwidth_kbps = 10000
