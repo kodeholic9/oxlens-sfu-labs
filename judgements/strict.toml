@@ -1,0 +1,6 @@
+# judgements/strict.toml
+# 엄격 판정 기준 (pristine 환경 검증용)
+
+max_loss_rate_percent = 0.1
+max_jitter = 100.0
+max_ooo_count = 5

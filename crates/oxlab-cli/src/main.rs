@@ -98,19 +98,13 @@ async fn cmd_scenario(path: String) {
     info!("=== OxLabs Scenario ===");
     match oxlab_scenario::run(&path).await {
         Ok(result) => {
-            info!("scenario '{}' complete", result.scenario_name);
-            if result.errors.is_empty() {
-                info!("  errors: none");
-            } else {
-                error!("  errors: {}", result.errors.len());
-                for e in &result.errors {
-                    error!("    - {}", e);
-                }
-            }
-            info!("  recv snapshots: {} participants", result.recv_snapshots.len());
+            // verdict는 engine에서 이미 print_summary() 호출함
+            let exit_code = if result.report.verdict == oxlab_judge::Verdict::Pass { 0 } else { 1 };
+            std::process::exit(exit_code);
         }
         Err(e) => {
             error!("scenario failed: {}", e);
+            std::process::exit(2);
         }
     }
 }

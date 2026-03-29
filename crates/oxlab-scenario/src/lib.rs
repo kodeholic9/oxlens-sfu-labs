@@ -9,6 +9,7 @@ pub mod engine;
 
 pub use engine::{ScenarioEngine, ScenarioResult};
 pub use model::{Scenario, ScenarioMeta, ParticipantDef, Action, ActionType};
+pub use oxlab_judge;
 
 /// 시나리오 파일 경로로 실행
 pub async fn run(scenario_path: &str) -> Result<ScenarioResult, Box<dyn std::error::Error>> {

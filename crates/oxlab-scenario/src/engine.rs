@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use oxlab_bot::{Bot, BotConfig, BotStatus};
+use oxlab_judge::{self, RecvInput, StreamInput, JudgeReport, Thresholds};
 use oxlab_net::{NetFilter, NetworkProfile};
 use tracing::{error, info, warn};
 
@@ -25,6 +26,8 @@ pub struct ScenarioResult {
     pub recv_snapshots: HashMap<String, oxlab_bot::RecvSnapshot>,
     /// 실행 중 발생한 에러
     pub errors: Vec<String>,
+    /// 판정 결과
+    pub report: JudgeReport,
 }
 
 /// 시나리오 엔진
@@ -98,6 +101,41 @@ impl ScenarioEngine {
             bot.disconnect().await;
         }
 
+        // 판정 실행
+        info!("═══ Judging ═══");
+        let thresholds = match &self.scenario.meta.judgement {
+            Some(name) => Thresholds::resolve(name),
+            None => Thresholds::default(),
+        };
+
+        let judge_inputs: HashMap<String, RecvInput> = recv_snapshots.iter()
+            .map(|(id, snap)| {
+                let input = RecvInput {
+                    total_packets: snap.total_packets,
+                    total_lost: snap.total_lost,
+                    total_ooo: snap.total_ooo,
+                    streams: snap.streams.iter().map(|s| StreamInput {
+                        ssrc: s.ssrc,
+                        pt: s.pt,
+                        packets_received: s.packets_received,
+                        packets_lost: s.packets_lost,
+                        out_of_order: s.out_of_order,
+                        jitter: s.jitter,
+                    }).collect(),
+                };
+                (id.clone(), input)
+            })
+            .collect();
+
+        let report = oxlab_judge::judge(
+            &self.scenario.meta.name,
+            &judge_inputs,
+            &self.errors,
+            &thresholds,
+        );
+
+        report.print_summary();
+
         info!("═══ Scenario '{}' complete (errors={}) ═══",
             self.scenario.meta.name, self.errors.len());
 
@@ -105,6 +143,7 @@ impl ScenarioEngine {
             scenario_name: self.scenario.meta.name.clone(),
             recv_snapshots,
             errors: self.errors,
+            report,
         }
     }
 

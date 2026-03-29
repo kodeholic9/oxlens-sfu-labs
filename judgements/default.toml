@@ -1,0 +1,11 @@
+# judgements/default.toml
+# 기본 판정 기준
+
+# 최대 허용 loss rate (%)
+max_loss_rate_percent = 5.0
+
+# 최대 허용 jitter (RTP timestamp 단위)
+max_jitter = 500.0
+
+# 최대 허용 out-of-order 패킷 수
+max_ooo_count = 50
