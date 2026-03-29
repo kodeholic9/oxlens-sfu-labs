@@ -192,6 +192,55 @@ async fn cmd_run(
 
         let publishing = bots.iter().filter(|b| b.status == BotStatus::Publishing).count();
         info!("=== {} / {} bots publishing ===", publishing, bot_count);
+
+        // TRACKS_UPDATE 이벤트 좌식 처리 → TRACKS_ACK 전송 (SubscriberGate 5초 지연 해소)
+        // RTP stream discovery는 비동기이므로 약간의 대기 필요
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for bot in &mut bots {
+            if bot.status == BotStatus::Publishing {
+                if let Err(e) = bot.process_events().await {
+                    error!("[{}] process_events failed: {}", bot.id(), e);
+                }
+            }
+        }
+    }
+
+    // ── PTT 라운드로빈 사이클 (WS 전용) ──
+    if media_enabled && mode == "ptt" {
+        info!("── PTT round-robin cycle (WS) ──");
+        let talk_secs = 3u64;
+        let gap_secs = 1u64;
+
+        for i in 0..bots.len() {
+            if bots[i].status != BotStatus::Publishing { continue; }
+
+            let bot_id = bots[i].id().to_string();
+            info!("[PTT] {} floor_request (WS)", bot_id);
+
+            let granted = match bots[i].floor_request_ws(0).await {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("[{}] floor_request_ws failed: {}", bot_id, e);
+                    false
+                }
+            };
+
+            if granted {
+                info!("[PTT] {} talking for {}s...", bot_id, talk_secs);
+                tokio::time::sleep(Duration::from_secs(talk_secs)).await;
+
+                info!("[PTT] {} floor_release (WS)", bot_id);
+                if let Err(e) = bots[i].floor_release_ws().await {
+                    error!("[{}] floor_release_ws failed: {}", bot_id, e);
+                }
+            }
+
+            // 화자 간 간격
+            if i + 1 < bots.len() {
+                tokio::time::sleep(Duration::from_secs(gap_secs)).await;
+            }
+        }
+        info!("── PTT cycle complete ──");
     }
 
     // ── Hold (heartbeat + recv metrics) ──
@@ -215,6 +264,9 @@ async fn cmd_run(
                     }
                 }
                 if bot.status == BotStatus::Publishing {
+                    if let Err(e) = bot.process_events().await {
+                        error!("[{}] process_events failed: {}", bot.id(), e);
+                    }
                     bot.log_recv_metrics();
                 }
             }

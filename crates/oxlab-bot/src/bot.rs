@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use oxlab_net::{FilterResult, NetFilter};
 use oxlens_lab_common::media::{self, SrtpCtx, is_rtp};
-use oxlens_lab_common::signaling::{SignalingSession, OP_PUBLISH_TRACKS};
+use std::collections::HashSet;
+use oxlens_lab_common::signaling::{
+    SignalingSession, OP_PUBLISH_TRACKS, OP_TRACKS_UPDATE, OP_TRACKS_ACK,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -102,6 +105,8 @@ pub struct Bot {
     /// 전체 미디어 task 중단 시그널
     media_cancel: Option<tokio::sync::watch::Sender<bool>>,
     net_filter: Option<Arc<Mutex<NetFilter>>>,
+    /// 다른 참여자들의 subscribe SSRC 목록 (TRACKS_ACK 응답용)
+    subscribe_ssrcs: HashSet<u32>,
 }
 
 impl Bot {
@@ -127,6 +132,7 @@ impl Bot {
             task_handles: Vec::new(),
             media_cancel: None,
             net_filter,
+            subscribe_ssrcs: HashSet::new(),
         }
     }
 
@@ -459,6 +465,128 @@ impl Bot {
         self.status = BotStatus::Publishing;
 
         info!("[bot:{}] publishing + subscribing started (4 tasks)", bot_id);
+        Ok(())
+    }
+
+    // ── PTT Floor Control ──
+
+    /// WS Floor Request (priority 지정 가능)
+    pub async fn floor_request_ws(&mut self, priority: u8) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let room_id = self.room_id.as_ref().ok_or("no room_id")?.clone();
+        let session = self.session.as_mut().ok_or("no session")?;
+        let resp = session.floor_request(&room_id, priority).await?;
+        let granted = resp.d.get("granted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let queued = resp.d.get("queued").and_then(|v| v.as_bool()).unwrap_or(false);
+        info!("[bot:{}] floor_request_ws granted={} queued={}", self.config.id, granted, queued);
+        Ok(granted)
+    }
+
+    /// WS Floor Release
+    pub async fn floor_release_ws(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let room_id = self.room_id.as_ref().ok_or("no room_id")?.clone();
+        let session = self.session.as_mut().ok_or("no session")?;
+        let resp = session.floor_release(&room_id).await?;
+        info!("[bot:{}] floor_release_ws ok={:?}", self.config.id, resp.ok);
+        Ok(())
+    }
+
+    /// MBCP Floor Request via UDP (RTCP APP subtype=0)
+    pub async fn send_mbcp_freq(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ssrc = self.rtp_config.audio_ssrc;
+        let pkt = oxlens_lab_common::mbcp::build_freq(ssrc);
+        info!("[bot:{}] MBCP FREQ ssrc=0x{:08X}", self.config.id, ssrc);
+        self.send_mbcp(&pkt).await
+    }
+
+    /// MBCP Floor Release via UDP (RTCP APP subtype=1)
+    pub async fn send_mbcp_frel(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ssrc = self.rtp_config.audio_ssrc;
+        let pkt = oxlens_lab_common::mbcp::build_frel(ssrc);
+        info!("[bot:{}] MBCP FREL ssrc=0x{:08X}", self.config.id, ssrc);
+        self.send_mbcp(&pkt).await
+    }
+
+    /// MBCP 패킷 전송 (SRTCP encrypt + pub socket)
+    async fn send_mbcp(&mut self, pkt: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let media = self.media.as_mut().ok_or("no media context")?;
+        let encrypted = media.pub_srtp.encrypt_rtcp(pkt)
+            .ok_or("SRTCP encrypt failed")?;
+        media.pub_socket.send_to(&encrypted, media.server_addr).await?;
+        Ok(())
+    }
+
+    // ── 이벤트 처리 ──
+
+    /// WS 이벤트 버퍼를 폴하고, TRACKS_UPDATE(add/remove) 처리 후 TRACKS_ACK 전송.
+    /// 변경이 있을 때만 ACK를 보낸다.
+    pub async fn process_events(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 1) WS 수신 버퍼 채우기 + TRACKS_UPDATE drain (session borrow scope)
+        let events = {
+            let session = match self.session.as_mut() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            session.poll_events().await;
+            session.drain_all_events(OP_TRACKS_UPDATE)
+        }; // session borrow 해제
+
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // 2) subscribe_ssrcs 갱신 (session borrow 없음)
+        let mut changed = false;
+        for evt in &events {
+            let action = evt.d.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let tracks = match evt.d.get("tracks").and_then(|v| v.as_array()) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            for track in tracks {
+                let ssrc = match track.get("ssrc").and_then(|v| v.as_u64()) {
+                    Some(s) => s as u32,
+                    None => continue,
+                };
+
+                match action {
+                    "add" => {
+                        if self.subscribe_ssrcs.insert(ssrc) {
+                            changed = true;
+                            let kind = track.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                            let user_id = track.get("user_id").and_then(|v| v.as_str()).unwrap_or("?");
+                            info!("[bot:{}] TRACKS_UPDATE add user={} kind={} ssrc=0x{:08X}",
+                                self.config.id, user_id, kind, ssrc);
+                        }
+                    }
+                    "remove" => {
+                        if self.subscribe_ssrcs.remove(&ssrc) {
+                            changed = true;
+                            info!("[bot:{}] TRACKS_UPDATE remove ssrc=0x{:08X}",
+                                self.config.id, ssrc);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 3) 변경 있으면 TRACKS_ACK 전송 (session 재차용)
+        if changed {
+            let ssrcs: Vec<u32> = self.subscribe_ssrcs.iter().copied().collect();
+            info!("[bot:{}] sending TRACKS_ACK ssrcs={} {:?}",
+                self.config.id, ssrcs.len(), ssrcs);
+
+            let session = self.session.as_mut().unwrap();
+            let resp = session.request(
+                OP_TRACKS_ACK,
+                serde_json::json!({ "ssrcs": ssrcs }),
+            ).await?;
+
+            let synced = resp.d.get("synced").and_then(|v| v.as_bool()).unwrap_or(false);
+            info!("[bot:{}] TRACKS_ACK response synced={}", self.config.id, synced);
+        }
+
         Ok(())
     }
 

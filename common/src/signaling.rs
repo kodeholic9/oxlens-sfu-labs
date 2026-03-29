@@ -18,6 +18,10 @@ pub const OP_ROOM_CREATE: u16 = 10;
 pub const OP_ROOM_JOIN: u16 = 11;
 pub const OP_PUBLISH_TRACKS: u16 = 15;
 
+// Track events (서버 opcode.rs와 동일)
+pub const OP_TRACKS_UPDATE: u16 = 101;
+pub const OP_TRACKS_ACK: u16 = 16;
+
 // Floor control opcodes (서버 opcode.rs와 동일)
 pub const OP_FLOOR_REQUEST: u16 = 40;
 pub const OP_FLOOR_RELEASE: u16 = 41;
@@ -311,6 +315,34 @@ impl SignalingSession {
             Some(self.event_buf.remove(idx))
         } else {
             None
+        }
+    }
+
+    /// 이벤트 버퍼에서 특정 opcode 패킷 전부 꺼냄
+    pub fn drain_all_events(&mut self, op: u16) -> Vec<Packet> {
+        let mut matched = Vec::new();
+        self.event_buf.retain(|p| {
+            if p.op == op {
+                matched.push(p.clone());
+                false
+            } else {
+                true
+            }
+        });
+        matched
+    }
+
+    /// 이벤트 버퍼에 쌓인 WS 메시지 수신 (non-blocking poll)
+    /// heartbeat/hold 루프에서 호출하여 event_buf를 채움
+    pub async fn poll_events(&mut self) {
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                self.recv_packet(),
+            ).await {
+                Ok(Ok(pkt)) => self.event_buf.push(pkt),
+                _ => break,
+            }
         }
     }
 
