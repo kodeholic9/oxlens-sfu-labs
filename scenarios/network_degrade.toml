@@ -1,0 +1,56 @@
+# scenarios/network_degrade.toml
+# 네트워크 열화 시뮬 — 양호→열악→복구
+
+[meta]
+name = "network_degrade"
+description = "네트워크 양호→열악→복구 (Conference, 3봇)"
+mode = "conference"
+
+[[participants]]
+id = "sender"
+profile = "pristine"
+publish = ["video", "audio"]
+
+[[participants]]
+id = "receiver_ok"
+profile = "pristine"
+publish = ["video", "audio"]
+
+[[participants]]
+id = "receiver_bad"
+profile = "pristine"
+publish = ["video", "audio"]
+
+[[actions]]
+at_sec = 0
+type = "all_join"
+
+[[actions]]
+at_sec = 2
+type = "start_media"
+
+# 7초: receiver_bad만 열악한 환경으로 전환
+[[actions]]
+at_sec = 7
+type = "network_transition"
+actor = "receiver_bad"
+profile = "field_lte_poor"
+
+# 12초: 5초 대기 (열화 상태 메트릭 수집)
+[[actions]]
+at_sec = 12
+type = "wait"
+duration_sec = 5.0
+
+# 17초: receiver_bad 복구
+[[actions]]
+at_sec = 17
+type = "network_transition"
+actor = "receiver_bad"
+profile = "pristine"
+
+# 18초: 5초 대기 (복구 후 메트릭)
+[[actions]]
+at_sec = 18
+type = "wait"
+duration_sec = 5.0

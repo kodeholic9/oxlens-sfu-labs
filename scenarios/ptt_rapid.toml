@@ -1,0 +1,74 @@
+# scenarios/ptt_rapid.toml
+# PTT 빠른 화자 전환 — 3봇 순차 발화
+
+[meta]
+name = "ptt_rapid"
+description = "PTT 빠른 화자 전환 (3명, 순차 3초 talk)"
+mode = "ptt"
+
+[[participants]]
+id = "speaker_a"
+profile = "pristine"
+publish = ["video", "audio"]
+
+[[participants]]
+id = "speaker_b"
+profile = "field_lte"
+publish = ["video", "audio"]
+
+[[participants]]
+id = "speaker_c"
+profile = "pristine"
+publish = ["video", "audio"]
+
+# 0초: 전원 입장
+[[actions]]
+at_sec = 0
+type = "all_join"
+
+# 2초: 미디어 시작
+[[actions]]
+at_sec = 2
+type = "start_media"
+
+# 6초: speaker_a 발화
+[[actions]]
+at_sec = 6
+type = "ptt_request"
+actor = "speaker_a"
+
+# 9초: speaker_a 해제
+[[actions]]
+at_sec = 9
+type = "ptt_release"
+actor = "speaker_a"
+
+# 10초: speaker_b 발화
+[[actions]]
+at_sec = 10
+type = "ptt_request"
+actor = "speaker_b"
+
+# 13초: speaker_b 해제
+[[actions]]
+at_sec = 13
+type = "ptt_release"
+actor = "speaker_b"
+
+# 14초: speaker_c 발화
+[[actions]]
+at_sec = 14
+type = "ptt_request"
+actor = "speaker_c"
+
+# 17초: speaker_c 해제
+[[actions]]
+at_sec = 17
+type = "ptt_release"
+actor = "speaker_c"
+
+# 18초: 5초 대기 (메트릭 수집)
+[[actions]]
+at_sec = 18
+type = "wait"
+duration_sec = 5.0

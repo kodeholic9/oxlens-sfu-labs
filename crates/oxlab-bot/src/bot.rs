@@ -468,6 +468,17 @@ impl Bot {
         Ok(())
     }
 
+    // ── 네트워크 필터 ──
+
+    /// 네트워크 필터 동적 전환 (시나리오 엔진이 호출)
+    pub fn update_net_filter(&self, config: oxlab_net::FilterConfig) {
+        if let Some(ref filter) = self.net_filter {
+            if let Ok(mut f) = filter.lock() {
+                f.update(config);
+            }
+        }
+    }
+
     // ── PTT Floor Control ──
 
     /// WS Floor Request (priority 지정 가능)

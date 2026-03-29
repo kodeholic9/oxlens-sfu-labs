@@ -1,0 +1,35 @@
+# scenarios/conf_basic.toml
+# Conference 기본 — 3봇 접속 + 미디어 + 10초 유지
+
+[meta]
+name = "conf_basic"
+description = "Conference 기본 3봇 (loss=0 기대)"
+mode = "conference"
+
+[[participants]]
+id = "user_a"
+profile = "pristine"
+publish = ["video", "audio"]
+
+[[participants]]
+id = "user_b"
+profile = "pristine"
+publish = ["video", "audio"]
+
+[[participants]]
+id = "user_c"
+profile = "pristine"
+publish = ["video", "audio"]
+
+[[actions]]
+at_sec = 0
+type = "all_join"
+
+[[actions]]
+at_sec = 2
+type = "start_media"
+
+[[actions]]
+at_sec = 5
+type = "wait"
+duration_sec = 10.0

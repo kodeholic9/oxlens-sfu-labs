@@ -26,6 +26,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 시나리오 TOML 파일 실행
+    Scenario {
+        /// 시나리오 TOML 파일 경로
+        path: String,
+    },
     /// 봇을 spawn하여 SFU에 접속
     Run {
         /// SFU 서버 주소
@@ -77,11 +82,35 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Scenario { path } => {
+            cmd_scenario(path).await;
+        }
         Commands::Run {
             server, port, room, mode,
             bots, profile, hold, media,
         } => {
             cmd_run(server, port, room, mode, bots, profile, hold, media).await;
+        }
+    }
+}
+
+async fn cmd_scenario(path: String) {
+    info!("=== OxLabs Scenario ===");
+    match oxlab_scenario::run(&path).await {
+        Ok(result) => {
+            info!("scenario '{}' complete", result.scenario_name);
+            if result.errors.is_empty() {
+                info!("  errors: none");
+            } else {
+                error!("  errors: {}", result.errors.len());
+                for e in &result.errors {
+                    error!("    - {}", e);
+                }
+            }
+            info!("  recv snapshots: {} participants", result.recv_snapshots.len());
+        }
+        Err(e) => {
+            error!("scenario failed: {}", e);
         }
     }
 }
