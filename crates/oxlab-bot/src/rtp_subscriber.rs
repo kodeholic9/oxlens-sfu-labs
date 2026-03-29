@@ -8,42 +8,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// RTP 고정 헤더 최소 파싱 (12 bytes)
-#[derive(Debug)]
-struct RtpMini {
-    pt: u8,
-    seq: u16,
-    ts: u32,
-    ssrc: u32,
-    marker: bool,
-}
-
-fn parse_rtp_mini(buf: &[u8]) -> Option<RtpMini> {
-    if buf.len() < 12 { return None; }
-    let b0 = buf[0];
-    // V=2 check
-    if (b0 >> 6) != 2 { return None; }
-    let b1 = buf[1];
-    let marker = (b1 & 0x80) != 0;
-    let pt = b1 & 0x7F;
-    let seq = u16::from_be_bytes([buf[2], buf[3]]);
-    let ts = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    Some(RtpMini { pt, seq, ts, ssrc, marker })
-}
-
-/// demux: first byte로 RTP vs RTCP 판별
-fn is_rtp_packet(buf: &[u8]) -> bool {
-    if buf.len() < 12 { return false; }
-    // RFC 5764: 0x80..=0xBF = SRTP/SRTCP
-    // RTP PT=72..76은 RTCP와 겹침 → PT 기반 추가 판별
-    let b1 = buf[1];
-    let pt = b1 & 0x7F;
-    // RTCP PT: 72(XR)..76(PSFB), 200(SR)..206(APP) → 실제로 72~79 범위
-    // RTP는 보통 96+ (dynamic) 또는 111(Opus) 등
-    !((72..=79).contains(&pt))
-}
-
 // ── SSRC별 수신 메트릭 ──
 
 /// 단일 SSRC의 수신 메트릭 (RFC 3550 기반)

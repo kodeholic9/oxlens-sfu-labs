@@ -11,8 +11,6 @@
 
 /// Opus payload type (전 브라우저 고정)
 pub const OPUS_PT: u8 = 111;
-/// Opus clock rate
-const OPUS_CLOCK_RATE: u32 = 48_000;
 /// Opus frame duration 20ms → 960 samples
 const OPUS_SAMPLES_PER_FRAME: u32 = 960;
 /// Opus silence payload (DTX compatible, 3 bytes)
@@ -20,8 +18,6 @@ const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
 /// VP8 default PT
 pub const VP8_DEFAULT_PT: u8 = 96;
-/// VP8 clock rate
-const VP8_CLOCK_RATE: u32 = 90_000;
 /// VP8 frame duration ~33ms → 3000 ticks at 90kHz
 const VP8_TICKS_PER_FRAME: u32 = 3_000;
 /// Keyframe interval (frames)
