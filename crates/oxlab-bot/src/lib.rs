@@ -5,9 +5,11 @@
 //! Phase 1: STUN+DTLS+SRTP 미디어 셋업 + Fake RTP 송수신
 
 pub mod bot;
+pub mod observations;
 pub mod rtp_publisher;
 pub mod rtp_subscriber;
 
 pub use bot::{Bot, BotConfig, BotStatus, MediaContext};
+pub use observations::{BotObservations, ObservationsInner, SrRecord, FloorGrantRecord};
 pub use rtp_publisher::{RtpPublisherConfig, RtpPublisherState};
 pub use rtp_subscriber::{RecvMetricsStore, RecvSnapshot};

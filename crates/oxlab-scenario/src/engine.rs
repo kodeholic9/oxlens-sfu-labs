@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use oxlab_bot::{Bot, BotConfig, BotStatus};
+use oxlab_bot::{Bot, BotConfig, BotStatus, ObservationsInner};
 use oxlab_judge::{
     self, RecvInput, StreamInput, JudgeReport, RegressionThresholds,
     CheckpointCategory, checkpoint_registry,
@@ -98,6 +98,13 @@ impl ScenarioEngine {
             }
         }
 
+        // 관측 데이터 수집 (L1 체크포인트용)
+        let mut bot_observations: HashMap<String, ObservationsInner> = HashMap::new();
+        for (id, &idx) in &self.bot_index {
+            let obs = self.bots[idx].observations.snapshot();
+            bot_observations.insert(id.clone(), obs);
+        }
+
         // 전체 봇 종료
         info!("═══ Disconnecting ═══");
         for bot in &mut self.bots {
@@ -155,6 +162,7 @@ impl ScenarioEngine {
         // Layer 1 체크포인트 평가
         let layer1_checkpoints = crate::checkpoint_eval::evaluate(
             &recv_snapshots,
+            &bot_observations,
             &categories,
             &self.scenario.meta.mode,
             profile_name,

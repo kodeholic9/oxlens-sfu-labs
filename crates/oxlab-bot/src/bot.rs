@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use crate::rtp_publisher::{
     build_publish_intent_json, RtpPublisherConfig, RtpPublisherState,
 };
+use crate::observations::BotObservations;
 use crate::rtp_subscriber::{
     RecvMetricsStore, RecvSnapshot, format_recv_summary,
 };
@@ -100,6 +101,8 @@ pub struct Bot {
     pub media: Option<MediaContext>,
     pub rtp_config: RtpPublisherConfig,
     pub recv_metrics: RecvMetricsStore,
+    /// Layer 1 관측 데이터
+    pub observations: BotObservations,
     /// Media task handles
     task_handles: Vec<JoinHandle<()>>,
     /// 전체 미디어 task 중단 시그널
@@ -129,6 +132,7 @@ impl Bot {
             media: None,
             rtp_config,
             recv_metrics: RecvMetricsStore::new(),
+            observations: BotObservations::new(),
             task_handles: Vec::new(),
             media_cancel: None,
             net_filter,
@@ -364,6 +368,7 @@ impl Bot {
         let pub_recv_bot_id = bot_id.clone();
         let pub_pli_flag = Arc::clone(&force_keyframe);
         let pub_video_ssrc = self.rtp_config.video_ssrc;
+        let pub_observations = self.observations.clone();
         let pub_recv_handle = tokio::spawn(async move {
             let mut srtp = pub_recv_keys.new_srtp_ctx();
             let mut cancel = cancel_rx_pub;
@@ -384,9 +389,10 @@ impl Bot {
                                 match srtp.decrypt_rtcp(&buf[..n]) {
                                     Some(plaintext) => {
                                         let prev = pub_pli_flag.load(Ordering::Relaxed);
-                                        parse_rtcp_for_pli(
+                                        parse_rtcp_compound(
                                             &plaintext, pub_video_ssrc,
-                                            &pub_pli_flag, &pub_recv_bot_id,
+                                            &pub_pli_flag, &pub_observations,
+                                            &pub_recv_bot_id,
                                         );
                                         if !prev && pub_pli_flag.load(Ordering::Relaxed) {
                                             pli_count += 1;
@@ -418,6 +424,7 @@ impl Bot {
         let sub_keys = media.sub_server_keys.clone();
         let metrics_store = self.recv_metrics.clone();
         let sub_bot_id = bot_id.clone();
+        let sub_observations = self.observations.clone();
         let sub_handle = tokio::spawn(async move {
             let mut srtp = sub_keys.new_srtp_ctx();
             let mut cancel = cancel_rx_sub;
@@ -446,8 +453,21 @@ impl Bot {
                                     let ssrc = u32::from_be_bytes([plaintext[8], plaintext[9], plaintext[10], plaintext[11]]);
                                     let rtp_pt = plaintext[1] & 0x7F;
                                     metrics_store.update(ssrc, rtp_pt, seq, ts);
+
+                                    // L1-07: PTT SSRC 추적 (audio=111, video=그 외)
+                                    if rtp_pt == 111 {
+                                        sub_observations.record_ptt_audio_ssrc(ssrc);
+                                    } else {
+                                        sub_observations.record_ptt_video_ssrc(ssrc);
+                                    }
+                                } else {
+                                    // RTCP — SR 파싱 (L1-02, L1-03)
+                                    if let Some(plaintext) = srtp.decrypt_rtcp(&buf[..n]) {
+                                        parse_rtcp_for_sr(
+                                            &plaintext, &sub_observations, &sub_bot_id,
+                                        );
+                                    }
                                 }
-                                // sub socket의 RTCP (서버 RR)는 메트릭 불필요 — 무시
                             }
                             Err(e) => {
                                 warn!("[bot:{}] sub recv error: {}", sub_bot_id, e);
@@ -489,6 +509,10 @@ impl Bot {
         let granted = resp.d.get("granted").and_then(|v| v.as_bool()).unwrap_or(false);
         let queued = resp.d.get("queued").and_then(|v| v.as_bool()).unwrap_or(false);
         info!("[bot:{}] floor_request_ws granted={} queued={}", self.config.id, granted, queued);
+
+        // L1-14: floor grant 순서 기록
+        self.observations.record_floor_grant(&self.config.id, priority, granted, queued);
+
         Ok(granted)
     }
 
@@ -596,6 +620,9 @@ impl Bot {
 
             let synced = resp.d.get("synced").and_then(|v| v.as_bool()).unwrap_or(false);
             info!("[bot:{}] TRACKS_ACK response synced={}", self.config.id, synced);
+
+            // L1-11: SubscriberGate ACK 완료 마킹
+            self.observations.mark_tracks_ack_sent();
         }
 
         Ok(())
@@ -673,11 +700,12 @@ fn simple_hash(s: &str) -> u32 {
     hash
 }
 
-/// RTCP compound 패킷에서 PLI (PT=206, FMT=1) 감지
-fn parse_rtcp_for_pli(
+/// RTCP compound 패킷 파싱 — PLI + RR + SR 감지
+fn parse_rtcp_compound(
     buf: &[u8],
     my_video_ssrc: u32,
     force_keyframe: &Arc<AtomicBool>,
+    observations: &BotObservations,
     bot_id: &str,
 ) {
     let mut offset = 0;
@@ -689,17 +717,83 @@ fn parse_rtcp_for_pli(
 
         if offset + pkt_len > buf.len() { break; }
 
-        // PSFB: PT=206, FMT=1 (PLI)
-        let fmt = b0 & 0x1F;
-        if pt == 206 && fmt == 1 && pkt_len >= 12 {
-            let media_ssrc = u32::from_be_bytes([
+        match pt {
+            // RR (PT=201) — L1-01: sender SSRC 기록
+            201 if pkt_len >= 8 => {
+                let sender_ssrc = u32::from_be_bytes([
+                    buf[offset + 4], buf[offset + 5],
+                    buf[offset + 6], buf[offset + 7],
+                ]);
+                observations.record_rr(sender_ssrc);
+                debug!("[bot:{}] RR received, sender_ssrc=0x{:08X}", bot_id, sender_ssrc);
+            }
+
+            // PSFB (PT=206), FMT=1 (PLI)
+            206 => {
+                let fmt = b0 & 0x1F;
+                if fmt == 1 && pkt_len >= 12 {
+                    let media_ssrc = u32::from_be_bytes([
+                        buf[offset + 8], buf[offset + 9],
+                        buf[offset + 10], buf[offset + 11],
+                    ]);
+                    if media_ssrc == my_video_ssrc {
+                        debug!("[bot:{}] PLI received for ssrc=0x{:08X}", bot_id, media_ssrc);
+                        force_keyframe.store(true, Ordering::Relaxed);
+                        observations.record_pli();
+                    }
+                }
+            }
+
+            _ => {} // 기타 RTCP 타입 무시
+        }
+
+        offset += pkt_len;
+    }
+}
+
+/// subscriber 측 RTCP compound 파싱 — SR 감지 (L1-02, L1-03)
+fn parse_rtcp_for_sr(
+    buf: &[u8],
+    observations: &BotObservations,
+    bot_id: &str,
+) {
+    let mut offset = 0;
+    while offset + 4 <= buf.len() {
+        let pt = buf[offset + 1];
+        let length_words = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        let pkt_len = (length_words + 1) * 4;
+
+        if offset + pkt_len > buf.len() { break; }
+
+        // SR (PT=200), 최소 28바이트 (header 4 + ssrc 4 + sender info 20)
+        if pt == 200 && pkt_len >= 28 {
+            let ssrc = u32::from_be_bytes([
+                buf[offset + 4], buf[offset + 5],
+                buf[offset + 6], buf[offset + 7],
+            ]);
+            let ntp_sec = u32::from_be_bytes([
                 buf[offset + 8], buf[offset + 9],
                 buf[offset + 10], buf[offset + 11],
             ]);
-            if media_ssrc == my_video_ssrc {
-                debug!("[bot:{}] PLI received for ssrc=0x{:08X}, forcing keyframe", bot_id, media_ssrc);
-                force_keyframe.store(true, Ordering::Relaxed);
-            }
+            let ntp_frac = u32::from_be_bytes([
+                buf[offset + 12], buf[offset + 13],
+                buf[offset + 14], buf[offset + 15],
+            ]);
+            let rtp_ts = u32::from_be_bytes([
+                buf[offset + 16], buf[offset + 17],
+                buf[offset + 18], buf[offset + 19],
+            ]);
+            let pkt_count = u32::from_be_bytes([
+                buf[offset + 20], buf[offset + 21],
+                buf[offset + 22], buf[offset + 23],
+            ]);
+            let oct_count = u32::from_be_bytes([
+                buf[offset + 24], buf[offset + 25],
+                buf[offset + 26], buf[offset + 27],
+            ]);
+            observations.record_sr(ssrc, ntp_sec, ntp_frac, rtp_ts, pkt_count, oct_count);
+            debug!("[bot:{}] SR received ssrc=0x{:08X} ntp={}.{} rtp_ts={}",
+                bot_id, ssrc, ntp_sec, ntp_frac, rtp_ts);
         }
 
         offset += pkt_len;
