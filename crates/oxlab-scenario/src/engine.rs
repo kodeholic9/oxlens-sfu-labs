@@ -14,7 +14,8 @@ use std::time::Duration;
 use oxlab_bot::{Bot, BotConfig, BotStatus, ObservationsInner};
 use oxlab_judge::{
     self, RecvInput, StreamInput, JudgeReport, RegressionThresholds,
-    CheckpointCategory, checkpoint_registry,
+    BaselineFile, CheckpointCategory, Verdict, RegressionVerdict,
+    checkpoint_registry,
 };
 use oxlab_net::{NetFilter, NetworkProfile};
 use tracing::{error, info, warn};
@@ -40,16 +41,24 @@ pub struct ScenarioEngine {
     /// 봇 ID → bots 벡터 인덱스
     bot_index: HashMap<String, usize>,
     errors: Vec<String>,
+    /// baseline 저장/로드 디렉토리
+    baselines_dir: std::path::PathBuf,
 }
 
 impl ScenarioEngine {
     /// 시나리오 파일 로드 + 엔진 초기화
     pub fn new(scenario: Scenario) -> Self {
+        Self::with_baselines_dir(scenario, std::path::PathBuf::from("baselines"))
+    }
+
+    /// baselines 디렉토리 명시 지정
+    pub fn with_baselines_dir(scenario: Scenario, baselines_dir: std::path::PathBuf) -> Self {
         Self {
             scenario,
             bots: Vec::new(),
             bot_index: HashMap::new(),
             errors: Vec::new(),
+            baselines_dir,
         }
     }
 
@@ -168,18 +177,47 @@ impl ScenarioEngine {
             profile_name,
         );
 
+        // Layer 2: baseline 로드
+        let baseline = BaselineFile::try_load(
+            &self.baselines_dir,
+            &self.scenario.meta.name,
+            profile_name,
+        );
+
         let report = oxlab_judge::judge(
             &self.scenario.meta.name,
             profile_name,
             layer1_checkpoints,
             total_applicable,
             &judge_inputs,
-            None,  // baseline: Phase 3에서 구현
+            baseline.as_ref(),
             &regression_thresholds,
             &self.errors,
         );
 
         report.print_summary();
+
+        // baseline 갱신: L1 PASS 이고 L2 REGRESS 아닐 때만
+        let should_update = report.layer1.verdict == Verdict::Pass
+            && report.layer2.verdict != RegressionVerdict::Regressed;
+        if should_update {
+            let new_baseline = oxlab_judge::create_baseline(&report);
+            let baseline_path = BaselineFile::resolve_path(
+                &self.baselines_dir,
+                &self.scenario.meta.name,
+                profile_name,
+            );
+            if let Err(e) = std::fs::create_dir_all(&self.baselines_dir) {
+                error!("failed to create baselines dir: {}", e);
+            } else if let Err(e) = new_baseline.save(&baseline_path) {
+                error!("failed to save baseline: {}", e);
+            } else {
+                info!("baseline saved: {}", baseline_path.display());
+            }
+        } else {
+            info!("baseline NOT updated (L1={} L2={})",
+                report.layer1.verdict, report.layer2.verdict);
+        }
 
         info!("═══ Scenario '{}' complete (errors={}) ═══",
             self.scenario.meta.name, self.errors.len());

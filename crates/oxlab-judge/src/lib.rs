@@ -387,6 +387,32 @@ impl BaselineFile {
     pub fn find(&self, participant_id: &str) -> Option<&BaselineEntry> {
         self.participants.iter().find(|e| e.participant_id == participant_id)
     }
+
+    /// baseline 키 생성: "{scenario}__{profile}"
+    pub fn baseline_key(scenario: &str, profile: &str) -> String {
+        format!("{}__{}", scenario, profile)
+    }
+
+    /// baseline 파일 경로 resolve
+    pub fn resolve_path(baselines_dir: &std::path::Path, scenario: &str, profile: &str) -> std::path::PathBuf {
+        let key = Self::baseline_key(scenario, profile);
+        baselines_dir.join(format!("{}.json", key))
+    }
+
+    /// baseline 파일 로드 시도 (없으면 None)
+    pub fn try_load(baselines_dir: &std::path::Path, scenario: &str, profile: &str) -> Option<Self> {
+        let path = Self::resolve_path(baselines_dir, scenario, profile);
+        match Self::load(&path) {
+            Ok(b) => {
+                tracing::info!("baseline loaded: {}", path.display());
+                Some(b)
+            }
+            Err(_) => {
+                tracing::info!("no baseline found: {} (first run)", path.display());
+                None
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -752,6 +778,107 @@ mod tests {
         let report = judge("test", "pristine", cps, 1, &recv, None, &RegressionThresholds::default(), &[]);
         assert_eq!(report.overall, Verdict::Pass);
         assert!(report.summary.contains("L1:1/1"));
+    }
+
+    #[test]
+    fn baseline_key_and_path() {
+        let key = BaselineFile::baseline_key("ptt_rapid", "field_lte");
+        assert_eq!(key, "ptt_rapid__field_lte");
+
+        let path = BaselineFile::resolve_path(
+            std::path::Path::new("baselines"),
+            "ptt_rapid",
+            "field_lte",
+        );
+        assert_eq!(path, std::path::PathBuf::from("baselines/ptt_rapid__field_lte.json"));
+    }
+
+    #[test]
+    fn baseline_save_load_roundtrip() {
+        let baseline = BaselineFile {
+            scenario: "test".into(),
+            profile: "pristine".into(),
+            timestamp: "123s".into(),
+            participants: vec![BaselineEntry {
+                participant_id: "bot_1".into(),
+                loss_rate_percent: 1.5,
+                max_jitter: 3.2,
+                total_ooo: 2,
+            }],
+        };
+        let dir = std::env::temp_dir().join("oxlab_test_baseline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test__pristine.json");
+        baseline.save(&path).unwrap();
+
+        let loaded = BaselineFile::load(&path).unwrap();
+        assert_eq!(loaded.scenario, "test");
+        assert_eq!(loaded.participants.len(), 1);
+        assert!((loaded.participants[0].loss_rate_percent - 1.5).abs() < 0.001);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn try_load_missing_returns_none() {
+        let result = BaselineFile::try_load(
+            std::path::Path::new("/nonexistent"),
+            "missing",
+            "pristine",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn baseline_update_policy() {
+        // L1 PASS + L2 NO_BASELINE → should update
+        let cps = vec![
+            CheckpointResult::pass("L1-01", "t", CheckpointCategory::RtcpTerminator, "", ""),
+        ];
+        let recv = HashMap::new();
+        let report = judge("test", "pristine", cps, 1, &recv, None, &RegressionThresholds::default(), &[]);
+        assert_eq!(report.overall, Verdict::Pass);
+        assert_eq!(report.layer2.verdict, RegressionVerdict::NoBaseline);
+        // should_update = L1 Pass && L2 != Regressed → true
+        let should_update = report.layer1.verdict == Verdict::Pass
+            && report.layer2.verdict != RegressionVerdict::Regressed;
+        assert!(should_update);
+    }
+
+    #[test]
+    fn baseline_no_update_on_l1_fail() {
+        let cps = vec![
+            CheckpointResult::fail("L1-01", "t", CheckpointCategory::RtcpTerminator, "", ""),
+        ];
+        let recv = HashMap::new();
+        let report = judge("test", "pristine", cps, 1, &recv, None, &RegressionThresholds::default(), &[]);
+        let should_update = report.layer1.verdict == Verdict::Pass
+            && report.layer2.verdict != RegressionVerdict::Regressed;
+        assert!(!should_update);
+    }
+
+    #[test]
+    fn baseline_no_update_on_regression() {
+        let cps = vec![
+            CheckpointResult::pass("L1-01", "t", CheckpointCategory::RtcpTerminator, "", ""),
+        ];
+        let mut recv = HashMap::new();
+        recv.insert("bot_1".to_string(), RecvInput {
+            total_packets: 1000, total_lost: 80, total_ooo: 5,
+            streams: vec![StreamInput { ssrc: 1, pt: 111, packets_received: 1000, packets_lost: 80, out_of_order: 5, jitter: 50.0 }],
+        });
+        let baseline = BaselineFile {
+            scenario: "test".into(), profile: "pristine".into(), timestamp: "0s".into(),
+            participants: vec![BaselineEntry {
+                participant_id: "bot_1".into(),
+                loss_rate_percent: 1.0, max_jitter: 5.0, total_ooo: 0,
+            }],
+        };
+        let report = judge("test", "pristine", cps, 1, &recv, Some(&baseline), &RegressionThresholds::default(), &[]);
+        assert_eq!(report.layer2.verdict, RegressionVerdict::Regressed);
+        let should_update = report.layer1.verdict == Verdict::Pass
+            && report.layer2.verdict != RegressionVerdict::Regressed;
+        assert!(!should_update);
     }
 
     #[test]

@@ -68,6 +68,20 @@ pub struct ObservationsInner {
     // ── L1-17: Lifecycle ──
     /// 좀비 봇 감지 (ROOM_EVENT leave 수신한 user_id 목록)
     pub zombie_cleanup_detected: Vec<String>,
+
+    // ── L1-08: PTT ts_gap ──
+    /// idle 후 복귀 시 RTP ts gap 기록
+    pub ptt_ts_gap_records: Vec<TsGapRecord>,
+
+    // ── L1-18 ~ L1-20: Simulcast ──
+    /// 레이어 전환 이벤트 기록
+    pub simulcast_layer_switches: Vec<LayerSwitchEvent>,
+
+    // ── L1-21: Screen Share ──
+    /// publisher가 송신한 screen share SSRC (publisher 봇 기록)
+    pub screen_share_ssrc_published: Option<u32>,
+    /// subscriber가 수신한 screen share SSRC 목록
+    pub screen_share_ssrcs_received: HashSet<u32>,
 }
 
 /// SR 수신 기록
@@ -89,6 +103,35 @@ pub struct FloorGrantRecord {
     pub granted: bool,
     pub queued: bool,
     pub timestamp_ms: u64,
+}
+
+/// PTT idle 후 복귀 시 ts gap 기록
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsGapRecord {
+    pub ssrc: u32,
+    /// 실제 벽시계 gap (ms)
+    pub wall_gap_ms: u64,
+    /// RTP timestamp gap
+    pub rtp_ts_gap: u32,
+    /// 샘플레이트 (audio=48000, video=90000)
+    pub sample_rate: u32,
+}
+
+/// Simulcast 레이어 전환 이벤트
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerSwitchEvent {
+    /// 요청한 레이어 ("h", "l", "pause")
+    pub requested_layer: String,
+    /// SUBSCRIBE_LAYER 전송 시점 (ms, epoch)
+    pub request_timestamp_ms: u64,
+    /// 전환 후 첫 keyframe 도착까지 시간 (ms), 미도착 시 None
+    pub keyframe_after_ms: Option<u64>,
+    /// 전환 전 마지막 RTP ts
+    pub ts_before: Option<u32>,
+    /// 전환 후 첫 RTP ts
+    pub ts_after: Option<u32>,
+    /// 전환 후 패킷 수신 여부 (타임아웃 내 패킷 도착 여부)
+    pub packets_after: bool,
 }
 
 impl BotObservations {
@@ -215,6 +258,38 @@ impl BotObservations {
     pub fn record_zombie_cleanup(&self, user_id: &str) {
         if let Ok(mut obs) = self.inner.lock() {
             obs.zombie_cleanup_detected.push(user_id.to_string());
+        }
+    }
+
+    // ── PTT ts_gap 관측 (L1-08) ──
+
+    pub fn record_ts_gap(&self, ssrc: u32, wall_gap_ms: u64, rtp_ts_gap: u32, sample_rate: u32) {
+        if let Ok(mut obs) = self.inner.lock() {
+            obs.ptt_ts_gap_records.push(TsGapRecord {
+                ssrc, wall_gap_ms, rtp_ts_gap, sample_rate,
+            });
+        }
+    }
+
+    // ── Simulcast 관측 (L1-18 ~ L1-20) ──
+
+    pub fn record_layer_switch(&self, event: LayerSwitchEvent) {
+        if let Ok(mut obs) = self.inner.lock() {
+            obs.simulcast_layer_switches.push(event);
+        }
+    }
+
+    // ── Screen Share 관측 (L1-21) ──
+
+    pub fn record_screen_share_published(&self, ssrc: u32) {
+        if let Ok(mut obs) = self.inner.lock() {
+            obs.screen_share_ssrc_published = Some(ssrc);
+        }
+    }
+
+    pub fn record_screen_share_received(&self, ssrc: u32) {
+        if let Ok(mut obs) = self.inner.lock() {
+            obs.screen_share_ssrcs_received.insert(ssrc);
         }
     }
 

@@ -37,15 +37,17 @@ pub fn evaluate(
             "L1-09" => eval_l1_09(bot_observations, def),
             "L1-11" => eval_l1_11(bot_observations, def),
             "L1-13" => eval_l1_13(recv_snapshots, def, profile),
-            "L1-08" => None, // ts_gap: 봇에서 idle→복귀 ts 추적 필요 → Phase 3
+            "L1-08" => eval_l1_08(bot_observations, def, mode),
             "L1-10" => eval_l1_10(bot_observations, def),
             "L1-12" => eval_l1_12(bot_observations, def),
             "L1-14" => eval_l1_14(bot_observations, def, mode),
             "L1-15" => eval_l1_15(bot_observations, def, mode),
             "L1-16" => eval_l1_16(bot_observations, def, mode),
             "L1-17" => eval_l1_17(bot_observations, def),
-            "L1-18" | "L1-19" | "L1-20" => None, // Simulcast: 봇에 레이어 전환 관측 필요 → Phase 3
-            "L1-21" => None, // Screen share: 봇에 screen 관측 필요 → Phase 3
+            "L1-18" => eval_l1_18(bot_observations, def),
+            "L1-19" => eval_l1_19(bot_observations, def),
+            "L1-20" => eval_l1_20(bot_observations, def),
+            "L1-21" => eval_l1_21(bot_observations, def),
             _ => None,
         };
 
@@ -710,6 +712,246 @@ fn eval_l1_17(
 }
 
 // ============================================================================
+// L1-08: PTT ts_gap continuity after idle
+// ============================================================================
+
+/// idle 후 복귀 시 RTP ts gap이 경과 시간을 반영해야 한다.
+/// 허용 오차: 20% (네트워크 지연, 타이밍 불확실성)
+fn eval_l1_08(
+    observations: &HashMap<String, ObservationsInner>,
+    def: &checkpoint_registry::CheckpointDef,
+    mode: &str,
+) -> Option<CheckpointResult> {
+    if mode != "ptt" { return None; }
+
+    let all_records: Vec<_> = observations.values()
+        .flat_map(|o| o.ptt_ts_gap_records.iter())
+        .collect();
+
+    if all_records.is_empty() {
+        return None; // 관측 데이터 없음 → skip
+    }
+
+    let mut violations = Vec::new();
+    for rec in &all_records {
+        let expected_ts = (rec.wall_gap_ms as f64 * rec.sample_rate as f64 / 1000.0) as u32;
+        if expected_ts == 0 { continue; }
+        let ratio = rec.rtp_ts_gap as f64 / expected_ts as f64;
+        // 0.8 ~ 1.2 범위 밖이면 위반
+        if ratio < 0.8 || ratio > 1.2 {
+            violations.push(format!(
+                "SSRC=0x{:08X} wall={}ms ts_gap={} expected≈{} ratio={:.2}",
+                rec.ssrc, rec.wall_gap_ms, rec.rtp_ts_gap, expected_ts, ratio
+            ));
+        }
+    }
+
+    if !violations.is_empty() {
+        Some(CheckpointResult::fail_from_def(
+            def,
+            &format!("{}/{} ts_gap violations: {}",
+                violations.len(), all_records.len(), violations.join("; ")),
+        ))
+    } else {
+        Some(CheckpointResult::pass_from_def(
+            def,
+            &format!("{} ts_gap records all within 20% tolerance", all_records.len()),
+        ))
+    }
+}
+
+// ============================================================================
+// L1-18: Simulcast layer switch — packets continue
+// ============================================================================
+
+/// 레이어 전환 후 패킷이 계속 도착해야 한다 (pause 제외).
+fn eval_l1_18(
+    observations: &HashMap<String, ObservationsInner>,
+    def: &checkpoint_registry::CheckpointDef,
+) -> Option<CheckpointResult> {
+    let all_switches: Vec<_> = observations.values()
+        .flat_map(|o| o.simulcast_layer_switches.iter())
+        .collect();
+
+    if all_switches.is_empty() {
+        return None; // simulcast 시나리오 아님 → skip
+    }
+
+    // pause 요청은 패킷 중단이 정상 → 검증 대상 제외
+    let active_switches: Vec<_> = all_switches.iter()
+        .filter(|s| s.requested_layer != "pause")
+        .collect();
+
+    if active_switches.is_empty() {
+        return None;
+    }
+
+    let mut failures = Vec::new();
+    for sw in &active_switches {
+        if !sw.packets_after {
+            failures.push(format!("layer={} no packets after switch", sw.requested_layer));
+        }
+    }
+
+    if !failures.is_empty() {
+        Some(CheckpointResult::fail_from_def(
+            def,
+            &format!("{}/{} switches without packets: {}",
+                failures.len(), active_switches.len(), failures.join("; ")),
+        ))
+    } else {
+        Some(CheckpointResult::pass_from_def(
+            def,
+            &format!("{} layer switches, all received packets", active_switches.len()),
+        ))
+    }
+}
+
+// ============================================================================
+// L1-19: Simulcast layer switch ts continuity
+// ============================================================================
+
+/// 레이어 전환 후 ts_after - ts_before 가 양수 (전진)이어야 한다.
+fn eval_l1_19(
+    observations: &HashMap<String, ObservationsInner>,
+    def: &checkpoint_registry::CheckpointDef,
+) -> Option<CheckpointResult> {
+    let all_switches: Vec<_> = observations.values()
+        .flat_map(|o| o.simulcast_layer_switches.iter())
+        .filter(|s| s.requested_layer != "pause")
+        .filter(|s| s.ts_before.is_some() && s.ts_after.is_some())
+        .collect();
+
+    if all_switches.is_empty() {
+        return None;
+    }
+
+    let mut violations = Vec::new();
+    for sw in &all_switches {
+        let before = sw.ts_before.unwrap();
+        let after = sw.ts_after.unwrap();
+        let diff = after.wrapping_sub(before) as i32;
+        if diff <= 0 {
+            violations.push(format!(
+                "layer={} ts backward: {} → {} (Δ={})",
+                sw.requested_layer, before, after, diff
+            ));
+        }
+    }
+
+    if !violations.is_empty() {
+        Some(CheckpointResult::fail_from_def(
+            def,
+            &format!("{} ts continuity violations: {}", violations.len(), violations.join("; ")),
+        ))
+    } else {
+        Some(CheckpointResult::pass_from_def(
+            def,
+            &format!("{} layer switches, ts continuity OK", all_switches.len()),
+        ))
+    }
+}
+
+// ============================================================================
+// L1-20: Simulcast layer switch keyframe first
+// ============================================================================
+
+/// 레이어 전환 후 keyframe이 도착해야 한다.
+fn eval_l1_20(
+    observations: &HashMap<String, ObservationsInner>,
+    def: &checkpoint_registry::CheckpointDef,
+) -> Option<CheckpointResult> {
+    let all_switches: Vec<_> = observations.values()
+        .flat_map(|o| o.simulcast_layer_switches.iter())
+        .filter(|s| s.requested_layer != "pause")
+        .collect();
+
+    if all_switches.is_empty() {
+        return None;
+    }
+
+    let mut no_keyframe = Vec::new();
+    let mut max_latency = 0u64;
+
+    for sw in &all_switches {
+        match sw.keyframe_after_ms {
+            Some(ms) => {
+                if ms > max_latency { max_latency = ms; }
+            }
+            None => {
+                no_keyframe.push(format!("layer={}", sw.requested_layer));
+            }
+        }
+    }
+
+    if !no_keyframe.is_empty() {
+        Some(CheckpointResult::fail_from_def(
+            def,
+            &format!("{}/{} switches without keyframe: {}",
+                no_keyframe.len(), all_switches.len(), no_keyframe.join(", ")),
+        ))
+    } else {
+        Some(CheckpointResult::pass_from_def(
+            def,
+            &format!("{} switches, all keyframe-first (max_latency={}ms)",
+                all_switches.len(), max_latency),
+        ))
+    }
+}
+
+// ============================================================================
+// L1-21: Screen share non-simulcast relay
+// ============================================================================
+
+/// screen share는 원본 SSRC 유지 + non-simulcast relay.
+/// publisher 봇의 screen SSRC와 subscriber 봇의 수신 screen SSRC가 일치해야 한다.
+fn eval_l1_21(
+    observations: &HashMap<String, ObservationsInner>,
+    def: &checkpoint_registry::CheckpointDef,
+) -> Option<CheckpointResult> {
+    // publisher 봇의 screen SSRC 수집
+    let published: Vec<u32> = observations.values()
+        .filter_map(|o| o.screen_share_ssrc_published)
+        .collect();
+
+    if published.is_empty() {
+        return None; // screen share 시나리오 아님 → skip
+    }
+
+    // subscriber 봇들의 수신 screen SSRC
+    let received: std::collections::HashSet<u32> = observations.values()
+        .flat_map(|o| o.screen_share_ssrcs_received.iter().copied())
+        .collect();
+
+    if received.is_empty() {
+        return Some(CheckpointResult::fail_from_def(
+            def,
+            &format!("screen published (SSRC={:?}) but no subscriber received it", published),
+        ));
+    }
+
+    // published SSRC가 received에 포함되어야 함 (원본 SSRC 유지 = non-simulcast)
+    let mut mismatches = Vec::new();
+    for pub_ssrc in &published {
+        if !received.contains(pub_ssrc) {
+            mismatches.push(format!("published=0x{:08X} not in received={:?}", pub_ssrc, received));
+        }
+    }
+
+    if !mismatches.is_empty() {
+        Some(CheckpointResult::fail_from_def(
+            def,
+            &format!("screen SSRC mismatch (virtual SSRC applied?): {}", mismatches.join("; ")),
+        ))
+    } else {
+        Some(CheckpointResult::pass_from_def(
+            def,
+            &format!("screen SSRC preserved: published={:?} received={:?}", published, received),
+        ))
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -933,5 +1175,217 @@ mod tests {
         let cats = vec![CheckpointCategory::Lifecycle];
         let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
         assert!(results.iter().all(|r| r.id != "L1-17"));
+    }
+
+    // ── L1-08 ──
+
+    #[test]
+    fn l1_08_ts_gap_within_tolerance_pass() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        // 3000ms idle, audio 48000Hz → expected ts_gap = 144000
+        obs.ptt_ts_gap_records.push(oxlab_bot::TsGapRecord {
+            ssrc: 0xA000, wall_gap_ms: 3000, rtp_ts_gap: 144000, sample_rate: 48000,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::PttRelay];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "ptt", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-08").unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn l1_08_ts_gap_too_small_fail() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        // 3000ms idle 인데 ts_gap이 너무 작음 (gap 미반영)
+        obs.ptt_ts_gap_records.push(oxlab_bot::TsGapRecord {
+            ssrc: 0xA000, wall_gap_ms: 3000, rtp_ts_gap: 48000, sample_rate: 48000,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::PttRelay];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "ptt", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-08").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn l1_08_conference_mode_skipped() {
+        let obs_map = HashMap::new();
+        let cats = vec![CheckpointCategory::PttRelay];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        assert!(results.iter().all(|r| r.id != "L1-08"));
+    }
+
+    // ── L1-18 ──
+
+    #[test]
+    fn l1_18_packets_after_switch_pass() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        obs.simulcast_layer_switches.push(oxlab_bot::LayerSwitchEvent {
+            requested_layer: "l".into(),
+            request_timestamp_ms: 1000,
+            keyframe_after_ms: Some(50),
+            ts_before: Some(90000),
+            ts_after: Some(95000),
+            packets_after: true,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::Simulcast];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-18").unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn l1_18_no_packets_after_switch_fail() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        obs.simulcast_layer_switches.push(oxlab_bot::LayerSwitchEvent {
+            requested_layer: "h".into(),
+            request_timestamp_ms: 1000,
+            keyframe_after_ms: None,
+            ts_before: Some(90000),
+            ts_after: None,
+            packets_after: false,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::Simulcast];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-18").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+    }
+
+    // ── L1-19 ──
+
+    #[test]
+    fn l1_19_ts_forward_pass() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        obs.simulcast_layer_switches.push(oxlab_bot::LayerSwitchEvent {
+            requested_layer: "l".into(),
+            request_timestamp_ms: 1000,
+            keyframe_after_ms: Some(50),
+            ts_before: Some(90000),
+            ts_after: Some(95000),
+            packets_after: true,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::Simulcast];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-19").unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn l1_19_ts_backward_fail() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        obs.simulcast_layer_switches.push(oxlab_bot::LayerSwitchEvent {
+            requested_layer: "h".into(),
+            request_timestamp_ms: 1000,
+            keyframe_after_ms: Some(50),
+            ts_before: Some(100000),
+            ts_after: Some(90000),
+            packets_after: true,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::Simulcast];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-19").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+    }
+
+    // ── L1-20 ──
+
+    #[test]
+    fn l1_20_keyframe_received_pass() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        obs.simulcast_layer_switches.push(oxlab_bot::LayerSwitchEvent {
+            requested_layer: "l".into(),
+            request_timestamp_ms: 1000,
+            keyframe_after_ms: Some(120),
+            ts_before: Some(90000),
+            ts_after: Some(95000),
+            packets_after: true,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::Simulcast];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-20").unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn l1_20_no_keyframe_fail() {
+        let mut obs_map = HashMap::new();
+        let mut obs = empty_obs();
+        obs.simulcast_layer_switches.push(oxlab_bot::LayerSwitchEvent {
+            requested_layer: "h".into(),
+            request_timestamp_ms: 1000,
+            keyframe_after_ms: None,
+            ts_before: Some(90000),
+            ts_after: Some(95000),
+            packets_after: true,
+        });
+        obs_map.insert("bot_1".into(), obs);
+
+        let cats = vec![CheckpointCategory::Simulcast];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-20").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+    }
+
+    // ── L1-21 ──
+
+    #[test]
+    fn l1_21_screen_ssrc_preserved_pass() {
+        let mut obs_map = HashMap::new();
+        // publisher 봇
+        let mut pub_obs = empty_obs();
+        pub_obs.screen_share_ssrc_published = Some(0xCC00);
+        obs_map.insert("bot_pub".into(), pub_obs);
+        // subscriber 봇
+        let mut sub_obs = empty_obs();
+        sub_obs.screen_share_ssrcs_received.insert(0xCC00);
+        obs_map.insert("bot_sub".into(), sub_obs);
+
+        let cats = vec![CheckpointCategory::ScreenShare];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-21").unwrap();
+        assert_eq!(r.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn l1_21_screen_ssrc_changed_fail() {
+        let mut obs_map = HashMap::new();
+        let mut pub_obs = empty_obs();
+        pub_obs.screen_share_ssrc_published = Some(0xCC00);
+        obs_map.insert("bot_pub".into(), pub_obs);
+        let mut sub_obs = empty_obs();
+        sub_obs.screen_share_ssrcs_received.insert(0xDD00); // 다른 SSRC = virtual 적용됨
+        obs_map.insert("bot_sub".into(), sub_obs);
+
+        let cats = vec![CheckpointCategory::ScreenShare];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        let r = results.iter().find(|r| r.id == "L1-21").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn l1_21_no_screen_share_skipped() {
+        let obs_map = HashMap::new();
+        let cats = vec![CheckpointCategory::ScreenShare];
+        let results = evaluate(&HashMap::new(), &obs_map, &cats, "conference", "pristine");
+        assert!(results.iter().all(|r| r.id != "L1-21"));
     }
 }

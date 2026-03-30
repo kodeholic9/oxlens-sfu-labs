@@ -172,6 +172,26 @@ impl SsrcRecvMetrics {
     }
 }
 
+/// 미니 RTP 헤더 파서 (SSRC/PT/seq/ts/marker 추출)
+pub struct RtpMini {
+    pub pt: u8,
+    pub seq: u16,
+    pub ts: u32,
+    pub ssrc: u32,
+    pub marker: bool,
+}
+
+/// RTP 패킷에서 최소 헤더 필드 추출 (12바이트 최소)
+pub fn parse_rtp_mini(pkt: &[u8]) -> Option<RtpMini> {
+    if pkt.len() < 12 { return None; }
+    let marker = (pkt[1] & 0x80) != 0;
+    let pt = pkt[1] & 0x7F;
+    let seq = u16::from_be_bytes([pkt[2], pkt[3]]);
+    let ts = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+    let ssrc = u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);
+    Some(RtpMini { pt, seq, ts, ssrc, marker })
+}
+
 /// 스냅샷을 로그 한 줄로 포맷
 pub fn format_recv_summary(bot_id: &str, snap: &RecvSnapshot) -> String {
     if snap.ssrc_count == 0 {

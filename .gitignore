@@ -18,3 +18,4 @@ Thumbs.db
 # OxLabs
 /reports/
 /snapshots/*.json
+/baselines/
