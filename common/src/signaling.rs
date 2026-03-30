@@ -28,6 +28,10 @@ pub const OP_FLOOR_RELEASE: u16 = 41;
 pub const OP_FLOOR_PING: u16 = 42;
 pub const OP_FLOOR_QUEUE_POS: u16 = 43;
 pub const OP_ROOM_SYNC: u16 = 50;
+pub const OP_SUBSCRIBE_LAYER: u16 = 51;
+
+// Room events (Server → Client)
+pub const OP_ROOM_EVENT: u16 = 100;
 
 // Floor events (Server → Client)
 pub const OP_FLOOR_TAKEN: u16 = 141;
@@ -306,6 +310,16 @@ impl SignalingSession {
     ) -> Result<Packet, Box<dyn std::error::Error + Send + Sync>> {
         self.request(OP_FLOOR_QUEUE_POS, serde_json::json!({
             "room_id": room_id,
+        })).await
+    }
+
+    /// SUBSCRIBE_LAYER (op=51) — simulcast 레이어 선택
+    pub async fn subscribe_layer(
+        &mut self,
+        targets: Vec<serde_json::Value>,
+    ) -> Result<Packet, Box<dyn std::error::Error + Send + Sync>> {
+        self.request(OP_SUBSCRIBE_LAYER, serde_json::json!({
+            "targets": targets,
         })).await
     }
 

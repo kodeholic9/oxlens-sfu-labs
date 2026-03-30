@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use oxlab_net::{FilterResult, NetFilter};
 use oxlens_lab_common::media::{self, SrtpCtx, is_rtp};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use oxlens_lab_common::signaling::{
     SignalingSession, OP_PUBLISH_TRACKS, OP_TRACKS_UPDATE, OP_TRACKS_ACK,
+    OP_FLOOR_TAKEN, OP_FLOOR_IDLE, OP_FLOOR_REVOKE, OP_ROOM_EVENT,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -39,6 +40,47 @@ pub enum BotStatus {
     Publishing,
     Failed,
     Stopped,
+}
+
+// ── Floor 상태 공유 (recv task ↔ WS event handler) ──
+
+#[derive(Clone)]
+pub struct SharedFloorState {
+    inner: Arc<SharedFloorStateInner>,
+}
+
+struct SharedFloorStateInner {
+    /// true = nobody talking (L1-04)
+    floor_idle: AtomicBool,
+    /// true after speaker change, reset after first video keyframe (L1-06)
+    speaker_just_changed: AtomicBool,
+    /// true after floor release, reset on next FLOOR_TAKEN (L1-05)
+    floor_just_released: AtomicBool,
+    /// ACK sent flag for recv task (L1-11)
+    ack_sent: AtomicBool,
+}
+
+impl SharedFloorState {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(SharedFloorStateInner {
+                floor_idle: AtomicBool::new(true),
+                speaker_just_changed: AtomicBool::new(false),
+                floor_just_released: AtomicBool::new(false),
+                ack_sent: AtomicBool::new(false),
+            }),
+        }
+    }
+}
+
+// ── Simulcast Layer Switch 관측 (L1-18~20) ──
+
+#[derive(Clone)]
+struct PendingLayerSwitch {
+    requested_layer: String,
+    request_time: tokio::time::Instant,
+    ts_before: Option<u32>,
+    done: bool,
 }
 
 // ── Bot 설정 ──
@@ -110,11 +152,15 @@ pub struct Bot {
     net_filter: Option<Arc<Mutex<NetFilter>>>,
     /// 다른 참여자들의 subscribe SSRC 목록 (TRACKS_ACK 응답용)
     subscribe_ssrcs: HashSet<u32>,
+    /// Floor state shared with recv tasks
+    floor_state: SharedFloorState,
+    /// Pending simulcast layer switch (L1-18~20)
+    pending_layer_switch: Arc<Mutex<Option<PendingLayerSwitch>>>,
 }
 
 impl Bot {
     pub fn new(config: BotConfig, net_filter: Option<NetFilter>) -> Self {
-        let id_hash = simple_hash(&config.id);
+        let id_hash = crate::rtcp_parser::simple_hash(&config.id);
         let rtp_config = RtpPublisherConfig {
             audio_ssrc: 0xA000_0000 | (id_hash & 0x00FF_FFFF),
             video_ssrc: 0xB000_0000 | (id_hash & 0x00FF_FFFF),
@@ -137,6 +183,8 @@ impl Bot {
             media_cancel: None,
             net_filter,
             subscribe_ssrcs: HashSet::new(),
+            floor_state: SharedFloorState::new(),
+            pending_layer_switch: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -361,10 +409,8 @@ impl Bot {
         });
 
         // ── 3. Pub socket recv task (PLI 감지) ──
-        // 서버는 PLI를 publisher의 pub address로 전송.
-        // pub PC의 server_key로 SRTCP decrypt 필요.
         let pub_recv_socket = Arc::clone(&media.pub_socket);
-        let pub_recv_keys = media.pub_server_keys.clone(); // server_key!
+        let pub_recv_keys = media.pub_server_keys.clone();
         let pub_recv_bot_id = bot_id.clone();
         let pub_pli_flag = Arc::clone(&force_keyframe);
         let pub_video_ssrc = self.rtp_config.video_ssrc;
@@ -389,7 +435,7 @@ impl Bot {
                                 match srtp.decrypt_rtcp(&buf[..n]) {
                                     Some(plaintext) => {
                                         let prev = pub_pli_flag.load(Ordering::Relaxed);
-                                        parse_rtcp_compound(
+                                        crate::rtcp_parser::parse_rtcp_compound(
                                             &plaintext, pub_video_ssrc,
                                             &pub_pli_flag, &pub_observations,
                                             &pub_recv_bot_id,
@@ -419,17 +465,21 @@ impl Bot {
             debug!("[bot:{}] pub recv loop ended", pub_recv_bot_id);
         });
 
-        // ── 4. Subscribe recv task (RTP 메트릭) ──
+        // ── 4. Subscribe recv task (RTP 메트릭 + L1 observation) ──
         let sub_socket = Arc::clone(&media.sub_socket);
         let sub_keys = media.sub_server_keys.clone();
         let metrics_store = self.recv_metrics.clone();
         let sub_bot_id = bot_id.clone();
         let sub_observations = self.observations.clone();
+        let sub_floor_state = self.floor_state.clone();
+        let sub_mode = self.config.mode.clone();
+        let sub_pending_switch = Arc::clone(&self.pending_layer_switch);
         let sub_handle = tokio::spawn(async move {
             let mut srtp = sub_keys.new_srtp_ctx();
             let mut cancel = cancel_rx_sub;
             let mut buf = vec![0u8; 2048];
 
+            let mut ssrc_last: HashMap<u32, (tokio::time::Instant, u32)> = HashMap::new();
             info!("[bot:{}] subscribe recv loop started", sub_bot_id);
             loop {
                 tokio::select! {
@@ -460,10 +510,82 @@ impl Bot {
                                     } else {
                                         sub_observations.record_ptt_video_ssrc(ssrc);
                                     }
+
+                                    // L1-04: PTT non-speaker gating
+                                    if sub_mode == "ptt" && sub_floor_state.inner.floor_idle.load(Ordering::Relaxed) {
+                                        sub_observations.record_ptt_non_speaker_rtp();
+                                    }
+
+                                    // L1-05: silence flush (Opus silence = PT 111, payload <= 3 bytes after header)
+                                    if sub_mode == "ptt" && sub_floor_state.inner.floor_just_released.load(Ordering::Relaxed) {
+                                        if rtp_pt == 111 && plaintext.len() >= 12 {
+                                            let payload_len = plaintext.len() - 12; // approximate, ignoring CSRC/ext
+                                            if payload_len <= 3 {
+                                                sub_observations.record_ptt_silence_frame();
+                                            }
+                                        }
+                                    }
+
+                                    // L1-06: first video after speaker change = keyframe?
+                                    if sub_mode == "ptt" && rtp_pt != 111
+                                        && sub_floor_state.inner.speaker_just_changed.swap(false, Ordering::Relaxed)
+                                    {
+                                        let is_kf = crate::rtcp_parser::detect_vp8_keyframe(&plaintext);
+                                        sub_observations.record_ptt_first_video_keyframe(is_kf);
+                                    }
+
+                                    // L1-11: video before ACK (non-audio only)
+                                    if rtp_pt != 111 && !sub_floor_state.inner.ack_sent.load(Ordering::Relaxed) {
+                                        sub_observations.record_video_before_ack();
+                                    }
+
+                                    // L1-08: PTT ts_gap tracking (idle > 1s gap)
+                                    {
+                                        let now = tokio::time::Instant::now();
+                                        if sub_mode == "ptt" {
+                                            if let Some(&(prev_time, prev_ts)) = ssrc_last.get(&ssrc) {
+                                                let wall_gap_ms = now.duration_since(prev_time).as_millis() as u64;
+                                                if wall_gap_ms > 1000 {
+                                                    let rtp_ts_gap = ts.wrapping_sub(prev_ts);
+                                                    let sample_rate = if rtp_pt == 111 { 48000u32 } else { 90000u32 };
+                                                    sub_observations.record_ts_gap(ssrc, wall_gap_ms, rtp_ts_gap, sample_rate);
+                                                }
+                                            }
+                                        }
+                                        ssrc_last.insert(ssrc, (now, ts)); // 모든 모드에서 업데이트 (L1-18~20 용)
+                                    }
+
+                                    // L1-18~20: Simulcast layer switch observation
+                                    if rtp_pt != 111 { // video only
+                                        if let Ok(mut pending) = sub_pending_switch.lock() {
+                                            if let Some(ref mut sw) = *pending {
+                                                if !sw.done {
+                                                    // ts_before: 이전에 기록된 video ts 사용
+                                                    if sw.ts_before.is_none() {
+                                                        sw.ts_before = ssrc_last.values()
+                                                            .map(|&(_, t)| t)
+                                                            .next();
+                                                    }
+                                                    let is_kf = crate::rtcp_parser::detect_vp8_keyframe(&plaintext);
+                                                    let elapsed = sw.request_time.elapsed().as_millis() as u64;
+                                                    let event = crate::observations::LayerSwitchEvent {
+                                                        requested_layer: sw.requested_layer.clone(),
+                                                        request_timestamp_ms: elapsed,
+                                                        keyframe_after_ms: if is_kf { Some(elapsed) } else { None },
+                                                        ts_before: sw.ts_before,
+                                                        ts_after: Some(ts),
+                                                        packets_after: true,
+                                                    };
+                                                    sub_observations.record_layer_switch(event);
+                                                    sw.done = true;
+                                                }
+                                            }
+                                        }
+                                    }
                                 } else {
                                     // RTCP — SR 파싱 (L1-02, L1-03)
                                     if let Some(plaintext) = srtp.decrypt_rtcp(&buf[..n]) {
-                                        parse_rtcp_for_sr(
+                                        crate::rtcp_parser::parse_rtcp_for_sr(
                                             &plaintext, &sub_observations, &sub_bot_id,
                                         );
                                     }
@@ -513,7 +635,37 @@ impl Bot {
         // L1-14: floor grant 순서 기록
         self.observations.record_floor_grant(&self.config.id, priority, granted, queued);
 
+        // L1-16: queue position 기록
+        if queued {
+            if let Some(pos) = resp.d.get("position").and_then(|v| v.as_u64()) {
+                self.observations.record_queue_position(pos as u32);
+            }
+        }
+
         Ok(granted)
+    }
+
+    /// Simulcast SUBSCRIBE_LAYER 전송 (L1-18~20 관측 시작)
+    pub async fn subscribe_layer(&mut self, layer: &str, ssrcs: &[u32]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let session = self.session.as_mut().ok_or("no session")?;
+        let targets: Vec<serde_json::Value> = ssrcs.iter().map(|&ssrc| {
+            serde_json::json!({ "ssrc": ssrc, "layer": layer })
+        }).collect();
+
+        // pending 설정 → recv task가 관측 (ts_before는 recv task에서 채움)
+        if let Ok(mut pending) = self.pending_layer_switch.lock() {
+            *pending = Some(PendingLayerSwitch {
+                requested_layer: layer.to_string(),
+                request_time: tokio::time::Instant::now(),
+                ts_before: None,
+                done: false,
+            });
+        }
+
+        let resp = session.subscribe_layer(targets).await?;
+        info!("[bot:{}] subscribe_layer layer={} ssrcs={:?} ok={:?}",
+            self.config.id, layer, ssrcs, resp.ok);
+        Ok(())
     }
 
     /// WS Floor Release
@@ -552,8 +704,7 @@ impl Bot {
 
     // ── 이벤트 처리 ──
 
-    /// WS 이벤트 버퍼를 폴하고, TRACKS_UPDATE(add/remove) 처리 후 TRACKS_ACK 전송.
-    /// 변경이 있을 때만 ACK를 보낸다.
+    /// WS 이벤트 버퍼를 폴하고, TRACKS_UPDATE(add/remove) + Floor/Room 이벤트 처리.
     pub async fn process_events(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1) WS 수신 버퍼 채우기 + TRACKS_UPDATE drain (session borrow scope)
         let events = {
@@ -564,10 +715,6 @@ impl Bot {
             session.poll_events().await;
             session.drain_all_events(OP_TRACKS_UPDATE)
         }; // session borrow 해제
-
-        if events.is_empty() {
-            return Ok(());
-        }
 
         // 2) subscribe_ssrcs 갱신 (session borrow 없음)
         let mut changed = false;
@@ -623,6 +770,48 @@ impl Bot {
 
             // L1-11: SubscriberGate ACK 완료 마킹
             self.observations.mark_tracks_ack_sent();
+            self.floor_state.inner.ack_sent.store(true, Ordering::Relaxed);
+        }
+
+        // ── Floor events (L1-15, L1-17 관측) ──
+        {
+            let session = match self.session.as_mut() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+
+            // FLOOR_TAKEN → floor active
+            for evt in session.drain_all_events(OP_FLOOR_TAKEN) {
+                self.floor_state.inner.floor_idle.store(false, Ordering::Relaxed);
+                self.floor_state.inner.speaker_just_changed.store(true, Ordering::Relaxed);
+                self.floor_state.inner.floor_just_released.store(false, Ordering::Relaxed);
+                let speaker = evt.d.get("user_id").and_then(|v| v.as_str()).unwrap_or("?");
+                debug!("[bot:{}] FLOOR_TAKEN speaker={}", self.config.id, speaker);
+            }
+
+            // FLOOR_IDLE → floor idle
+            for _evt in session.drain_all_events(OP_FLOOR_IDLE) {
+                self.floor_state.inner.floor_idle.store(true, Ordering::Relaxed);
+                self.floor_state.inner.floor_just_released.store(true, Ordering::Relaxed);
+                debug!("[bot:{}] FLOOR_IDLE", self.config.id);
+            }
+
+            // FLOOR_REVOKE → L1-15
+            for _evt in session.drain_all_events(OP_FLOOR_REVOKE) {
+                self.observations.record_floor_revoke();
+                debug!("[bot:{}] FLOOR_REVOKE received", self.config.id);
+            }
+
+            // ROOM_EVENT leave → L1-17 zombie cleanup
+            for evt in session.drain_all_events(OP_ROOM_EVENT) {
+                let action = evt.d.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if action == "leave" {
+                    if let Some(uid) = evt.d.get("user_id").and_then(|v| v.as_str()) {
+                        self.observations.record_zombie_cleanup(uid);
+                        debug!("[bot:{}] ROOM_EVENT leave user={}", self.config.id, uid);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -688,114 +877,5 @@ impl Bot {
 
     pub fn id(&self) -> &str {
         &self.config.id
-    }
-}
-
-/// 간단한 문자열 해시 (SSRC 생성용)
-fn simple_hash(s: &str) -> u32 {
-    let mut hash: u32 = 5381;
-    for b in s.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(b as u32);
-    }
-    hash
-}
-
-/// RTCP compound 패킷 파싱 — PLI + RR + SR 감지
-fn parse_rtcp_compound(
-    buf: &[u8],
-    my_video_ssrc: u32,
-    force_keyframe: &Arc<AtomicBool>,
-    observations: &BotObservations,
-    bot_id: &str,
-) {
-    let mut offset = 0;
-    while offset + 4 <= buf.len() {
-        let b0 = buf[offset];
-        let pt = buf[offset + 1];
-        let length_words = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-        let pkt_len = (length_words + 1) * 4;
-
-        if offset + pkt_len > buf.len() { break; }
-
-        match pt {
-            // RR (PT=201) — L1-01: sender SSRC 기록
-            201 if pkt_len >= 8 => {
-                let sender_ssrc = u32::from_be_bytes([
-                    buf[offset + 4], buf[offset + 5],
-                    buf[offset + 6], buf[offset + 7],
-                ]);
-                observations.record_rr(sender_ssrc);
-                debug!("[bot:{}] RR received, sender_ssrc=0x{:08X}", bot_id, sender_ssrc);
-            }
-
-            // PSFB (PT=206), FMT=1 (PLI)
-            206 => {
-                let fmt = b0 & 0x1F;
-                if fmt == 1 && pkt_len >= 12 {
-                    let media_ssrc = u32::from_be_bytes([
-                        buf[offset + 8], buf[offset + 9],
-                        buf[offset + 10], buf[offset + 11],
-                    ]);
-                    if media_ssrc == my_video_ssrc {
-                        debug!("[bot:{}] PLI received for ssrc=0x{:08X}", bot_id, media_ssrc);
-                        force_keyframe.store(true, Ordering::Relaxed);
-                        observations.record_pli();
-                    }
-                }
-            }
-
-            _ => {} // 기타 RTCP 타입 무시
-        }
-
-        offset += pkt_len;
-    }
-}
-
-/// subscriber 측 RTCP compound 파싱 — SR 감지 (L1-02, L1-03)
-fn parse_rtcp_for_sr(
-    buf: &[u8],
-    observations: &BotObservations,
-    bot_id: &str,
-) {
-    let mut offset = 0;
-    while offset + 4 <= buf.len() {
-        let pt = buf[offset + 1];
-        let length_words = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-        let pkt_len = (length_words + 1) * 4;
-
-        if offset + pkt_len > buf.len() { break; }
-
-        // SR (PT=200), 최소 28바이트 (header 4 + ssrc 4 + sender info 20)
-        if pt == 200 && pkt_len >= 28 {
-            let ssrc = u32::from_be_bytes([
-                buf[offset + 4], buf[offset + 5],
-                buf[offset + 6], buf[offset + 7],
-            ]);
-            let ntp_sec = u32::from_be_bytes([
-                buf[offset + 8], buf[offset + 9],
-                buf[offset + 10], buf[offset + 11],
-            ]);
-            let ntp_frac = u32::from_be_bytes([
-                buf[offset + 12], buf[offset + 13],
-                buf[offset + 14], buf[offset + 15],
-            ]);
-            let rtp_ts = u32::from_be_bytes([
-                buf[offset + 16], buf[offset + 17],
-                buf[offset + 18], buf[offset + 19],
-            ]);
-            let pkt_count = u32::from_be_bytes([
-                buf[offset + 20], buf[offset + 21],
-                buf[offset + 22], buf[offset + 23],
-            ]);
-            let oct_count = u32::from_be_bytes([
-                buf[offset + 24], buf[offset + 25],
-                buf[offset + 26], buf[offset + 27],
-            ]);
-            observations.record_sr(ssrc, ntp_sec, ntp_frac, rtp_ts, pkt_count, oct_count);
-            debug!("[bot:{}] SR received ssrc=0x{:08X} ntp={}.{} rtp_ts={}",
-                bot_id, ssrc, ntp_sec, ntp_frac, rtp_ts);
-        }
-
-        offset += pkt_len;
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod bot;
 pub mod observations;
+pub(crate) mod rtcp_parser;
 pub mod rtp_publisher;
 pub mod rtp_subscriber;
 
