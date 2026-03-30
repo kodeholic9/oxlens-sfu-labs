@@ -1,11 +1,15 @@
 # judgements/default.toml
-# 기본 판정 기준
+# Layer 2 회귀 감지 기본 임계치
+# 절대 기준이 아닌 "이전 대비 변화량" 임계치
 
-# 최대 허용 loss rate (%)
-max_loss_rate_percent = 5.0
+# loss rate 증가 허용 (절대%p, 이전 대비 +2%p 이상이면 REGRESS)
+loss_rate_delta = 2.0
 
-# 최대 허용 jitter (RTP timestamp 단위)
-max_jitter = 500.0
+# jitter 증가 허용 (비율, 이전 대비 +50% 이상이면 REGRESS)
+jitter_increase_ratio = 0.5
 
-# 최대 허용 out-of-order 패킷 수
-max_ooo_count = 50
+# OOO 증가 허용 (비율, 이전 대비 +100% 이상이면 REGRESS)
+ooo_increase_ratio = 1.0
+
+# floor grant latency 증가 허용 (절대 ms)
+floor_grant_latency_delta_ms = 100.0

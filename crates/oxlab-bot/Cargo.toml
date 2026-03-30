@@ -5,6 +5,9 @@ edition = "2021"
 description = "Traffic bot for OxLabs — fake participants for SFU testing"
 authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
 
+[features]
+test-util = []
+
 [dependencies]
 oxlens-lab-common = { path = "../../common" }
 oxlab-net = { path = "../oxlab-net" }

@@ -99,7 +99,7 @@ async fn cmd_scenario(path: String) {
     match oxlab_scenario::run(&path).await {
         Ok(result) => {
             // verdict는 engine에서 이미 print_summary() 호출함
-            let exit_code = if result.report.verdict == oxlab_judge::Verdict::Pass { 0 } else { 1 };
+            let exit_code = if result.report.overall == oxlab_judge::Verdict::Pass { 0 } else { 1 };
             std::process::exit(exit_code);
         }
         Err(e) => {

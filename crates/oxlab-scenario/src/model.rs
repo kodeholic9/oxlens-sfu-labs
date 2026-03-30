@@ -34,6 +34,10 @@ pub struct ScenarioMeta {
     /// 판정 기준 파일명 (judgements/ 디렉토리 내)
     #[serde(default)]
     pub judgement: Option<String>,
+    /// Layer 1 체크포인트 카테고리 필터 (e.g. ["PttRelay", "FloorControl"])
+    /// 비어있으면 전체 카테고리 적용
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 fn default_server() -> String { "127.0.0.1".to_string() }

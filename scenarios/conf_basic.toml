@@ -5,6 +5,7 @@
 name = "conf_basic"
 description = "Conference 기본 3봇 (loss=0 기대)"
 mode = "conference"
+categories = ["core_relay", "lifecycle"]
 
 [[participants]]
 id = "user_a"

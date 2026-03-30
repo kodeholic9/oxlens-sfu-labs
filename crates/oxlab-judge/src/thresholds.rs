@@ -1,43 +1,55 @@
 // author: kodeholic (powered by Claude)
-//! Thresholds — 판정 기준 (TOML 로드 가능)
+//! RegressionThresholds — Layer 2 회귀 감지 임계치
+//!
+//! 절대 기준이 아닌 "이전 대비 변화량" 임계치.
+//! 같은 시나리오+프로파일에서 이전 실행 대비 회귀를 감지한다.
 
 use serde::{Deserialize, Serialize};
 
-/// 판정 기준 임계치
+/// 회귀 감지 임계치
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Thresholds {
-    /// 최대 허용 loss rate (%, 이상이면 FAIL)
-    #[serde(default = "default_max_loss")]
-    pub max_loss_rate_percent: f64,
-    /// 최대 허용 jitter (RTP timestamp 단위, 이상이면 FAIL)
-    #[serde(default = "default_max_jitter")]
-    pub max_jitter: f64,
-    /// 최대 허용 out-of-order 패킷 수
-    #[serde(default = "default_max_ooo")]
-    pub max_ooo_count: u64,
+pub struct RegressionThresholds {
+    /// loss rate 증가 허용 (절대%, e.g. 2.0 → 이전 대비 +2%p 이상이면 REGRESS)
+    #[serde(default = "default_loss_delta")]
+    pub loss_rate_delta: f64,
+
+    /// jitter 증가 허용 (비율, e.g. 0.5 → 이전 대비 +50% 이상이면 REGRESS)
+    #[serde(default = "default_jitter_ratio")]
+    pub jitter_increase_ratio: f64,
+
+    /// OOO 증가 허용 (비율, e.g. 1.0 → 이전 대비 +100% 이상이면 REGRESS)
+    #[serde(default = "default_ooo_ratio")]
+    pub ooo_increase_ratio: f64,
+
+    /// floor grant latency 증가 허용 (절대 ms)
+    #[serde(default = "default_floor_latency_delta")]
+    pub floor_grant_latency_delta_ms: f64,
 }
 
-fn default_max_loss() -> f64 { 5.0 }
-fn default_max_jitter() -> f64 { 500.0 }
-fn default_max_ooo() -> u64 { 50 }
+fn default_loss_delta() -> f64 { 2.0 }
+fn default_jitter_ratio() -> f64 { 0.5 }
+fn default_ooo_ratio() -> f64 { 1.0 }
+fn default_floor_latency_delta() -> f64 { 100.0 }
 
-impl Default for Thresholds {
+impl Default for RegressionThresholds {
     fn default() -> Self {
         Self {
-            max_loss_rate_percent: default_max_loss(),
-            max_jitter: default_max_jitter(),
-            max_ooo_count: default_max_ooo(),
+            loss_rate_delta: default_loss_delta(),
+            jitter_increase_ratio: default_jitter_ratio(),
+            ooo_increase_ratio: default_ooo_ratio(),
+            floor_grant_latency_delta_ms: default_floor_latency_delta(),
         }
     }
 }
 
-impl Thresholds {
-    /// 엄격 기준 (pristine 환경 검증용)
+impl RegressionThresholds {
+    /// 엄격 기준
     pub fn strict() -> Self {
         Self {
-            max_loss_rate_percent: 0.1,
-            max_jitter: 100.0,
-            max_ooo_count: 5,
+            loss_rate_delta: 0.5,
+            jitter_increase_ratio: 0.2,
+            ooo_increase_ratio: 0.5,
+            floor_grant_latency_delta_ms: 50.0,
         }
     }
 
@@ -56,7 +68,7 @@ impl Thresholds {
             other => {
                 let path = std::path::Path::new("judgements").join(format!("{}.toml", other));
                 Self::load(&path).unwrap_or_else(|e| {
-                    tracing::warn!("failed to load judgement '{}': {}, using default", other, e);
+                    tracing::warn!("failed to load regression thresholds '{}': {}, using default", other, e);
                     Self::default()
                 })
             }
@@ -70,20 +82,21 @@ mod tests {
 
     #[test]
     fn default_thresholds() {
-        let t = Thresholds::default();
-        assert_eq!(t.max_loss_rate_percent, 5.0);
-        assert_eq!(t.max_ooo_count, 50);
+        let t = RegressionThresholds::default();
+        assert_eq!(t.loss_rate_delta, 2.0);
+        assert_eq!(t.ooo_increase_ratio, 1.0);
     }
 
     #[test]
     fn parse_toml() {
         let toml = r#"
-max_loss_rate_percent = 2.0
-max_jitter = 200.0
-max_ooo_count = 10
+loss_rate_delta = 1.0
+jitter_increase_ratio = 0.3
+ooo_increase_ratio = 0.5
+floor_grant_latency_delta_ms = 80.0
 "#;
-        let t: Thresholds = toml::from_str(toml).unwrap();
-        assert_eq!(t.max_loss_rate_percent, 2.0);
-        assert_eq!(t.max_ooo_count, 10);
+        let t: RegressionThresholds = toml::from_str(toml).unwrap();
+        assert_eq!(t.loss_rate_delta, 1.0);
+        assert_eq!(t.floor_grant_latency_delta_ms, 80.0);
     }
 }

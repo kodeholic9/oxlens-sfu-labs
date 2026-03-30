@@ -5,6 +5,7 @@
 name = "ptt_rapid"
 description = "PTT 빠른 화자 전환 (3명, 순차 3초 talk)"
 mode = "ptt"
+categories = ["ptt_relay", "floor_control", "core_relay"]
 
 [[participants]]
 id = "speaker_a"

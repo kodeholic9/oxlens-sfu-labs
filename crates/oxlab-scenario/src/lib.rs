@@ -6,6 +6,7 @@
 
 pub mod model;
 pub mod engine;
+pub mod checkpoint_eval;
 
 pub use engine::{ScenarioEngine, ScenarioResult};
 pub use model::{Scenario, ScenarioMeta, ParticipantDef, Action, ActionType};

@@ -24,6 +24,8 @@ pub struct SsrcRecvMetrics {
     last_seq: u16,
     /// 최고 seq (wrap 고려)
     max_seq_seen: u16,
+    /// 첫 수신 seq
+    pub first_seq: u16,
     /// 첫 패킷 여부
     initialized: bool,
     /// 이전 패킷 도착 시각 (jitter 계산용)
@@ -47,6 +49,7 @@ impl SsrcRecvMetrics {
             jitter: 0.0,
             last_seq: 0,
             max_seq_seen: 0,
+            first_seq: 0,
             initialized: false,
             last_arrival: Instant::now(),
             last_rtp_ts: 0,
@@ -59,6 +62,7 @@ impl SsrcRecvMetrics {
         let now = Instant::now();
 
         if !self.initialized {
+            self.first_seq = seq;
             self.last_seq = seq;
             self.max_seq_seen = seq;
             self.last_arrival = now;
@@ -154,6 +158,17 @@ impl RecvMetricsStore {
             ssrc_count: streams.len(),
             streams,
         }
+    }
+}
+
+impl SsrcRecvMetrics {
+    /// 테스트용 생성자 (rx/lost 직접 설정)
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_for_test(ssrc: u32, pt: u8, packets_received: u64, packets_lost: u64) -> Self {
+        let mut m = Self::new(ssrc, pt);
+        m.packets_received = packets_received;
+        m.packets_lost = packets_lost;
+        m
     }
 }
 

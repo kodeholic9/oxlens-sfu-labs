@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use oxlab_bot::{Bot, BotConfig, BotStatus};
-use oxlab_judge::{self, RecvInput, StreamInput, JudgeReport, Thresholds};
+use oxlab_judge::{
+    self, RecvInput, StreamInput, JudgeReport, RegressionThresholds,
+    CheckpointCategory, checkpoint_registry,
+};
 use oxlab_net::{NetFilter, NetworkProfile};
 use tracing::{error, info, warn};
 
@@ -103,9 +106,9 @@ impl ScenarioEngine {
 
         // 판정 실행
         info!("═══ Judging ═══");
-        let thresholds = match &self.scenario.meta.judgement {
-            Some(name) => Thresholds::resolve(name),
-            None => Thresholds::default(),
+        let regression_thresholds = match &self.scenario.meta.judgement {
+            Some(name) => RegressionThresholds::resolve(name),
+            None => RegressionThresholds::default(),
         };
 
         let judge_inputs: HashMap<String, RecvInput> = recv_snapshots.iter()
@@ -127,11 +130,45 @@ impl ScenarioEngine {
             })
             .collect();
 
+        // Layer 1: 카테고리 필터링
+        let categories: Vec<CheckpointCategory> = if self.scenario.meta.categories.is_empty() {
+            // 비어있으면 전체 적용
+            vec![]
+        } else {
+            self.scenario.meta.categories.iter()
+                .filter_map(|s| CheckpointCategory::from_str_loose(s))
+                .collect()
+        };
+
+        let applicable_defs = if categories.is_empty() {
+            checkpoint_registry::REGISTRY.iter().collect::<Vec<_>>()
+        } else {
+            checkpoint_registry::find_by_categories(&categories)
+        };
+        let total_applicable = applicable_defs.len();
+
+        // 프로파일명 추출 (첫 번째 참가자 기준)
+        let profile_name = self.scenario.participants.first()
+            .map(|p| p.profile.as_str())
+            .unwrap_or("unknown");
+
+        // Layer 1 체크포인트 평가
+        let layer1_checkpoints = crate::checkpoint_eval::evaluate(
+            &recv_snapshots,
+            &categories,
+            &self.scenario.meta.mode,
+            profile_name,
+        );
+
         let report = oxlab_judge::judge(
             &self.scenario.meta.name,
+            profile_name,
+            layer1_checkpoints,
+            total_applicable,
             &judge_inputs,
+            None,  // baseline: Phase 3에서 구현
+            &regression_thresholds,
             &self.errors,
-            &thresholds,
         );
 
         report.print_summary();
