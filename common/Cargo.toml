@@ -28,6 +28,9 @@ crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# wire v3 단일 출처 (opcode/header/code) — 자체 복제 금지
+oxsig = { workspace = true }
+
 # logging
 tracing = "0.1"
 

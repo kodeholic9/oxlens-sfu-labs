@@ -208,20 +208,43 @@ fn write_mid_extension(pkt: &mut [u8], offset: usize, mid_extmap_id: u8, mid: &s
     // Remaining bytes already zero (padding)
 }
 
+/// rid extmap id (RFC 8852 simulcast) — 봇 자기선언, mid(1) 충돌 회피. (oxe2e 정합)
+pub const RID_EXTMAP_ID: u8 = 4;
+
 // ── PUBLISH_TRACKS Intent JSON 생성 ──
 
-/// Phase D PUBLISH_TRACKS intent payload 생성
-pub fn build_publish_intent_json(config: &RtpPublisherConfig) -> serde_json::Value {
+/// v3 PUBLISH_TRACKS intent payload (oxe2e 포맷 정합, 2026-06-11 per-track mid).
+///
+/// 계약: `action:"add"` + per-track `{mid, ssrc(non-zero), duplex}`. ssrc==0 는 track_ops
+/// 가드에 막혀 등록 안 됨 → RTP 매칭 실패 → TRACKS_UPDATE 미발행. room_id 는 request_routed 주입.
+/// `duplex`: "full"(broadcast/conf) | "half"(ptt floor gating).
+pub fn build_publish_intent_json(config: &RtpPublisherConfig, duplex: &str) -> serde_json::Value {
+    let rtx_pt = config.video_pt + 1;
     serde_json::json!({
-        "tracks": [
-            { "kind": "audio", "ssrc": 0 },
-            { "kind": "video", "ssrc": 0, "source": "camera", "codec": "VP8" }
-        ],
+        "action": "add",
         "mid_extmap_id": config.mid_extmap_id,
-        "audio_mid": config.audio_mid,
-        "video_mid": config.video_mid,
+        "rid_extmap_id": RID_EXTMAP_ID,
         "video_pt": config.video_pt,
-        "rtx_pt": config.video_pt + 1
+        "rtx_pt": rtx_pt,
+        "tracks": [
+            {
+                "kind": "audio",
+                "mid": config.audio_mid,
+                "ssrc": config.audio_ssrc,
+                "duplex": duplex,
+            },
+            {
+                "kind": "video",
+                "mid": config.video_mid,
+                "ssrc": config.video_ssrc,
+                "source": "camera",
+                "codec": "VP8",
+                "pt": config.video_pt,
+                "rtx_pt": rtx_pt,
+                "duplex": duplex,
+                "simulcast": false,
+            },
+        ],
     })
 }
 
@@ -318,13 +341,22 @@ mod tests {
             audio_mid: "0".to_string(),
             video_mid: "1".to_string(),
         };
-        let json = build_publish_intent_json(&config);
+        let json = build_publish_intent_json(&config, "full");
+        assert_eq!(json["action"], "add");
         assert_eq!(json["mid_extmap_id"], 1);
-        assert_eq!(json["audio_mid"], "0");
-        assert_eq!(json["video_mid"], "1");
         assert_eq!(json["video_pt"], 96);
         assert_eq!(json["rtx_pt"], 97);
-        assert_eq!(json["tracks"].as_array().unwrap().len(), 2);
+        let tracks = json["tracks"].as_array().unwrap();
+        assert_eq!(tracks.len(), 2);
+        // per-track mid + non-zero ssrc + duplex (v3 계약)
+        assert_eq!(tracks[0]["kind"], "audio");
+        assert_eq!(tracks[0]["mid"], "0");
+        assert_eq!(tracks[0]["ssrc"], 1);
+        assert_eq!(tracks[0]["duplex"], "full");
+        assert_eq!(tracks[1]["kind"], "video");
+        assert_eq!(tracks[1]["mid"], "1");
+        assert_eq!(tracks[1]["ssrc"], 2);
+        assert_eq!(tracks[1]["simulcast"], false);
     }
 
     #[test]

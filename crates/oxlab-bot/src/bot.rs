@@ -13,9 +13,9 @@ use oxlab_net::{FilterResult, NetFilter};
 use oxlens_lab_common::media::{self, SrtpCtx, is_rtp};
 use std::collections::{HashMap, HashSet};
 use oxlens_lab_common::signaling::{
-    SignalingSession, OP_PUBLISH_TRACKS, OP_TRACKS_UPDATE, OP_TRACKS_ACK,
-    OP_FLOOR_TAKEN, OP_FLOOR_IDLE, OP_FLOOR_REVOKE, OP_ROOM_EVENT,
+    SignalingSession, OP_PUBLISH_TRACKS, OP_TRACKS_UPDATE, OP_ROOM_EVENT,
 };
+use oxlens_lab_common::mbcp::{self, SUBTYPE_FTKN, SUBTYPE_FIDL, SUBTYPE_FRVK};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -97,7 +97,7 @@ pub struct BotConfig {
     pub profile: Option<String>,
 }
 
-fn default_ws_port() -> u16 { 9222 }
+fn default_ws_port() -> u16 { 1974 }
 fn default_mode() -> String { "conference".to_string() }
 
 // ── SRTP Keying Material ──
@@ -297,11 +297,13 @@ impl Bot {
     pub async fn publish_intent(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // ptt 모드 = half-duplex(floor gating), 그 외(broadcast/conference) = full.
+        let duplex = if self.config.mode == "ptt" { "half" } else { "full" };
+        let payload = build_publish_intent_json(&self.rtp_config, duplex);
         let session = self.session.as_mut().ok_or("no signaling session")?;
-        let payload = build_publish_intent_json(&self.rtp_config);
         info!("[bot:{}] sending PUBLISH_TRACKS intent: {}", self.config.id, payload);
 
-        let resp = session.request(OP_PUBLISH_TRACKS, payload).await?;
+        let resp = session.request_routed(OP_PUBLISH_TRACKS, payload).await?;
         if resp.ok != Some(true) {
             return Err(format!("PUBLISH_TRACKS failed: {:?}", resp.d).into());
         }
@@ -623,26 +625,45 @@ impl Bot {
 
     // ── PTT Floor Control ──
 
-    /// WS Floor Request (priority 지정 가능)
+    /// Floor Request — v3 FLOOR_MBCP (WS binary fallback) FREQ 송신 + FTKN 대기.
+    /// 단일 화자 capacity 에선 경쟁 없이 즉시 grant. 시그니처는 시나리오 호환 보존.
     pub async fn floor_request_ws(&mut self, priority: u8) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let room_id = self.room_id.as_ref().ok_or("no room_id")?.clone();
-        let session = self.session.as_mut().ok_or("no session")?;
-        let resp = session.floor_request(&room_id, priority).await?;
-        let granted = resp.d.get("granted").and_then(|v| v.as_bool()).unwrap_or(false);
-        let queued = resp.d.get("queued").and_then(|v| v.as_bool()).unwrap_or(false);
-        info!("[bot:{}] floor_request_ws granted={} queued={}", self.config.id, granted, queued);
-
-        // L1-14: floor grant 순서 기록
-        self.observations.record_floor_grant(&self.config.id, priority, granted, queued);
-
-        // L1-16: queue position 기록
-        if queued {
-            if let Some(pos) = resp.d.get("position").and_then(|v| v.as_u64()) {
-                self.observations.record_queue_position(pos as u32);
-            }
+        let ssrc = self.rtp_config.audio_ssrc;
+        let pkt = mbcp::build_freq(ssrc);
+        {
+            let session = self.session.as_mut().ok_or("no session")?;
+            session.send_floor_mbcp(&pkt).await?;
         }
+        info!("[bot:{}] MBCP FREQ (floor request) ssrc=0x{:08X}", self.config.id, ssrc);
 
+        let granted = self.await_floor_taken(Duration::from_secs(1)).await;
+        // L1-14: floor grant 순서 기록 (queued 개념 폐기 — MBCP 즉시성)
+        self.observations.record_floor_grant(&self.config.id, priority, granted, false);
         Ok(granted)
+    }
+
+    /// FLOOR_MBCP FTKN 도착 대기 (timeout). floor 획득 확인.
+    async fn await_floor_taken(&mut self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            if let Some(session) = self.session.as_mut() {
+                session.poll_events().await;
+                for raw in session.drain_floor_mbcp() {
+                    if let Some(msg) = mbcp::parse(&raw) {
+                        if msg.subtype == SUBTYPE_FTKN {
+                            self.floor_state.inner.floor_idle.store(false, Ordering::Relaxed);
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Simulcast SUBSCRIBE_LAYER 전송 (L1-18~20 관측 시작)
@@ -668,12 +689,13 @@ impl Bot {
         Ok(())
     }
 
-    /// WS Floor Release
+    /// Floor Release — v3 FLOOR_MBCP (WS binary) FREL 송신.
     pub async fn floor_release_ws(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let room_id = self.room_id.as_ref().ok_or("no room_id")?.clone();
+        let ssrc = self.rtp_config.audio_ssrc;
+        let pkt = mbcp::build_frel(ssrc);
         let session = self.session.as_mut().ok_or("no session")?;
-        let resp = session.floor_release(&room_id).await?;
-        info!("[bot:{}] floor_release_ws ok={:?}", self.config.id, resp.ok);
+        session.send_floor_mbcp(&pkt).await?;
+        info!("[bot:{}] MBCP FREL (floor release)", self.config.id);
         Ok(())
     }
 
@@ -753,20 +775,14 @@ impl Bot {
             }
         }
 
-        // 3) 변경 있으면 TRACKS_ACK 전송 (session 재차용)
+        // 3) 변경 있으면 TRACKS_READY 전송 (구 TRACKS_ACK — SubscriberGate resume + PLI)
         if changed {
-            let ssrcs: Vec<u32> = self.subscribe_ssrcs.iter().copied().collect();
-            info!("[bot:{}] sending TRACKS_ACK ssrcs={} {:?}",
-                self.config.id, ssrcs.len(), ssrcs);
+            let sub_count = self.subscribe_ssrcs.len();
+            info!("[bot:{}] sending TRACKS_READY (subs={})", self.config.id, sub_count);
 
             let session = self.session.as_mut().unwrap();
-            let resp = session.request(
-                OP_TRACKS_ACK,
-                serde_json::json!({ "ssrcs": ssrcs }),
-            ).await?;
-
-            let synced = resp.d.get("synced").and_then(|v| v.as_bool()).unwrap_or(false);
-            info!("[bot:{}] TRACKS_ACK response synced={}", self.config.id, synced);
+            let resp = session.tracks_ready().await?;
+            debug!("[bot:{}] TRACKS_READY ok={:?}", self.config.id, resp.ok);
 
             // L1-11: SubscriberGate ACK 완료 마킹
             self.observations.mark_tracks_ack_sent();
@@ -780,26 +796,27 @@ impl Bot {
                 None => return Ok(()),
             };
 
-            // FLOOR_TAKEN → floor active
-            for evt in session.drain_all_events(OP_FLOOR_TAKEN) {
-                self.floor_state.inner.floor_idle.store(false, Ordering::Relaxed);
-                self.floor_state.inner.speaker_just_changed.store(true, Ordering::Relaxed);
-                self.floor_state.inner.floor_just_released.store(false, Ordering::Relaxed);
-                let speaker = evt.d.get("user_id").and_then(|v| v.as_str()).unwrap_or("?");
-                debug!("[bot:{}] FLOOR_TAKEN speaker={}", self.config.id, speaker);
-            }
-
-            // FLOOR_IDLE → floor idle
-            for _evt in session.drain_all_events(OP_FLOOR_IDLE) {
-                self.floor_state.inner.floor_idle.store(true, Ordering::Relaxed);
-                self.floor_state.inner.floor_just_released.store(true, Ordering::Relaxed);
-                debug!("[bot:{}] FLOOR_IDLE", self.config.id);
-            }
-
-            // FLOOR_REVOKE → L1-15
-            for _evt in session.drain_all_events(OP_FLOOR_REVOKE) {
-                self.observations.record_floor_revoke();
-                debug!("[bot:{}] FLOOR_REVOKE received", self.config.id);
+            // v3 Floor = FLOOR_MBCP (0x2400) self-describing TLV (FTKN/FIDL/FRVK)
+            for raw in session.drain_floor_mbcp() {
+                let Some(msg) = mbcp::parse(&raw) else { continue };
+                match msg.subtype {
+                    SUBTYPE_FTKN => {
+                        self.floor_state.inner.floor_idle.store(false, Ordering::Relaxed);
+                        self.floor_state.inner.speaker_just_changed.store(true, Ordering::Relaxed);
+                        self.floor_state.inner.floor_just_released.store(false, Ordering::Relaxed);
+                        debug!("[bot:{}] MBCP FTKN ssrc=0x{:08X}", self.config.id, msg.ssrc);
+                    }
+                    SUBTYPE_FIDL => {
+                        self.floor_state.inner.floor_idle.store(true, Ordering::Relaxed);
+                        self.floor_state.inner.floor_just_released.store(true, Ordering::Relaxed);
+                        debug!("[bot:{}] MBCP FIDL", self.config.id);
+                    }
+                    SUBTYPE_FRVK => {
+                        self.observations.record_floor_revoke();
+                        debug!("[bot:{}] MBCP FRVK", self.config.id);
+                    }
+                    _ => {}
+                }
             }
 
             // ROOM_EVENT leave → L1-17 zombie cleanup

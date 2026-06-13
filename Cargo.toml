@@ -1,12 +1,19 @@
+# author: kodeholic (powered by Claude)
 [workspace]
 members = [
     "common",
-    "bench",
-    "e2e-ptt",
     "crates/oxlab-net",
     "crates/oxlab-bot",
     "crates/oxlab-scenario",
     "crates/oxlab-judge",
     "crates/oxlab-cli",
 ]
+# bench/ + e2e-ptt/ 폐기 (2026-06-13 capacity wire v3): 둘 다 v2 정수 opcode + WS JSON floor
+# (현 서버 v3 에서 폐기된 경로) = 현 서버에 못 붙는 화석. bench 측정 골격(send ts latency /
+# seq-gap loss)은 oxlab-bot 으로 흡수. 디렉토리 삭제는 부장님 검토 후 별도.
 resolver = "2"
+
+# wire v3 단일 출처 — oxsig 를 path dependency 로 참조 (OXLABS_DESIGN §3 의도 복원).
+# opcode/헤더 자체 복제 금지. 서버 crate 는 참조만, 수정 0.
+[workspace.dependencies]
+oxsig = { path = "../oxlens-sfu-server/crates/oxsig" }

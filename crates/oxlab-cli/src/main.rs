@@ -11,10 +11,13 @@
 //!   oxlab run --media --hold 10                  # .env + 일부 오버라이드
 //!   oxlab run --server 10.0.0.1 --port 9222      # 전체 명시
 
+mod capacity;
+mod distributed;
+
 use clap::{Parser, Subcommand};
 use oxlab_bot::{Bot, BotConfig, BotStatus};
 use oxlab_net::{NetFilter, NetworkProfile};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -37,8 +40,8 @@ enum Commands {
         #[arg(long, env = "OXLAB_SERVER", default_value = "127.0.0.1")]
         server: String,
 
-        /// WS 포트
-        #[arg(long, env = "OXLAB_WS_PORT", default_value_t = 9222)]
+        /// WS 포트 (hub)
+        #[arg(long, env = "OXLAB_WS_PORT", default_value_t = 1974)]
         port: u16,
 
         /// 방 이름
@@ -65,6 +68,63 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         media: bool,
     },
+    /// Capacity 부하 측정 — N 스윕으로 SFU 천장 곡선 산출
+    Cap {
+        /// SFU 서버(hub) 주소
+        #[arg(long, env = "OXLAB_SERVER", default_value = "127.0.0.1")]
+        server: String,
+        /// hub WS 포트
+        #[arg(long, env = "OXLAB_WS_PORT", default_value_t = 1974)]
+        port: u16,
+        /// 모드: broadcast(1 pub→N sub, full) | ptt(floor speaker 1→listener N, half)
+        #[arg(long, default_value = "broadcast")]
+        mode: String,
+        /// N 스윕 리스트 (콤마 구분)
+        #[arg(long, default_value = "50,100,200,500,1000")]
+        sweep: String,
+        /// 각 N 측정 시간(초)
+        #[arg(long, default_value_t = 30)]
+        duration: u64,
+        /// 전수복호(Full, latency 측정) 봇 수 — 나머지는 Count(복호-skip)
+        #[arg(long = "full", default_value_t = 3)]
+        full_count: usize,
+    },
+    /// 분산 capacity coordinator — publisher 1 + worker K 프로세스로 sub 분산
+    CapDist {
+        #[arg(long, default_value = "127.0.0.1")]
+        server: String,
+        #[arg(long, default_value_t = 1974)]
+        port: u16,
+        /// 총 sub 봇 수 (worker 들로 분배)
+        #[arg(long, default_value_t = 500)]
+        total: usize,
+        /// worker 프로세스 수
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+        #[arg(long, default_value_t = 30)]
+        duration: u64,
+        #[arg(long = "full", default_value_t = 3)]
+        full_count: usize,
+    },
+    /// 분산 worker (coordinator 가 spawn — 직접 호출 비권장)
+    CapWorker {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        room: String,
+        #[arg(long)]
+        count: usize,
+        #[arg(long = "full", default_value_t = 0)]
+        full_count: usize,
+        #[arg(long)]
+        duration: u64,
+        #[arg(long = "start-at-ms")]
+        start_at_ms: u64,
+        #[arg(long, default_value_t = 0)]
+        wid: usize,
+    },
 }
 
 #[tokio::main]
@@ -90,6 +150,31 @@ async fn main() {
             bots, profile, hold, media,
         } => {
             cmd_run(server, port, room, mode, bots, profile, hold, media).await;
+        }
+        Commands::Cap {
+            server, port, mode, sweep, duration, full_count,
+        } => {
+            let sweep_vec: Vec<usize> = sweep
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            if sweep_vec.is_empty() {
+                error!("invalid --sweep '{}' (expected e.g. 50,100,200)", sweep);
+                std::process::exit(2);
+            }
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            capacity::run_capacity(server, port, mode, sweep_vec, duration, full_count, ts).await;
+        }
+        Commands::CapDist { server, port, total, workers, duration, full_count } => {
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64).unwrap_or(0);
+            distributed::run_distributed(server, port, total, workers, duration, full_count, ts).await;
+        }
+        Commands::CapWorker { server, port, room, count, full_count, duration, start_at_ms, wid } => {
+            distributed::run_cap_worker(server, port, room, count, full_count, duration, start_at_ms, wid).await;
         }
     }
 }

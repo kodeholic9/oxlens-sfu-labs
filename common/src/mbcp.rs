@@ -140,7 +140,47 @@ pub fn parse_compound(buf: &[u8]) -> Vec<MbcpMessage> {
     results
 }
 
-/// 편의 빌더: Floor Request
+// ── v3 native TLV (TS 24.380 §8.2) — WS FLOOR_MBCP(0x2400) / DC 경로 ──
+//
+// 서버 floor_ops 는 `mbcp_native::parse` 로 받는다 (위 RTCP APP 포맷 ≠ native TLV).
+// wire: byte0 = V(2)|R(1)|A(1)|Type(4), byte1 = field_count, 이후 [id(1)|len(1)|value] × N.
+
+/// native MBCP msg_type: FLOOR_REQUEST.
+pub const MSG_FLOOR_REQUEST: u8 = 0;
+/// native MBCP msg_type: FLOOR_RELEASE.
+pub const MSG_FLOOR_RELEASE: u8 = 3;
+/// native MBCP field id: priority.
+const NATIVE_FIELD_PRIORITY: u8 = 0;
+/// native MBCP field id: destinations (발화 대상 방 목록 — FLOOR_REQUEST 필수).
+const NATIVE_FIELD_DESTINATIONS: u8 = 0x18;
+/// native MBCP ack-required 비트 (byte0 bit4).
+const NATIVE_ACK_REQ: u8 = 0x10;
+
+/// native FLOOR_REQUEST — priority + destinations(발화 대상 방). WS FLOOR_MBCP body.
+/// destinations TLV 필수 (서버 resolve_floor_target — 누락 시 DENY "missing destinations TLV").
+/// value = count(u8) + [room_id_len(u8) + utf8] × count.
+pub fn build_native_freq(priority: u8, room_id: &str) -> Vec<u8> {
+    let rb = room_id.as_bytes();
+    // destinations value: count=1, [len, utf8]
+    let mut dest = Vec::with_capacity(2 + rb.len());
+    dest.push(1u8); // count
+    dest.push(rb.len() as u8);
+    dest.extend_from_slice(rb);
+
+    let mut out = vec![NATIVE_ACK_REQ | MSG_FLOOR_REQUEST, 2]; // field_count=2
+    out.extend_from_slice(&[NATIVE_FIELD_PRIORITY, 1, priority]);
+    out.push(NATIVE_FIELD_DESTINATIONS);
+    out.push(dest.len() as u8);
+    out.extend_from_slice(&dest);
+    out
+}
+
+/// native FLOOR_RELEASE (필드 없음). WS FLOOR_MBCP body.
+pub fn build_native_frel() -> Vec<u8> {
+    vec![MSG_FLOOR_RELEASE, 0]
+}
+
+/// 편의 빌더: Floor Request (구 RTCP APP 포맷 — UDP RTCP 경로용. WS 는 native 사용).
 pub fn build_freq(ssrc: u32) -> Vec<u8> {
     build(SUBTYPE_FREQ, ssrc, None)
 }
